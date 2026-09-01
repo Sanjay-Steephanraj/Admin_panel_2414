@@ -1,0 +1,11 @@
+containerImagePullPolicy: Always
+image: ml-arkAi-toxic:latest
+
+arkAiNodeSelector: nickname=tesla
+
+arkAiMemoryRequest: 500Mi
+arkAiCPURequest: 800m
+arkAiDesiredReplicas: 1
+
+arkAiMemoryLimit: 1500Mi
+arkAiCPULimit: 1200m

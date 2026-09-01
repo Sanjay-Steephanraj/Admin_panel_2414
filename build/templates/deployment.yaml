@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: donor-ai
+spec:
+  selector:
+    matchLabels:
+      app: donor-ai
+  replicas: {{ .Values.arkAiDesiredReplicas }}
+  template:
+    metadata:
+      labels:
+        app: donor-ai
+    spec:
+      # tolerations:
+      # - key: "environment"
+      #   operator: "Equal"
+      #   value: "tesla"
+      #   effect: "NoSchedule"
+{{- if .Values.arkAiNodeSelector }} # <--- Start of conditional block
+      nodeSelector:
+{{- $label := split "=" .Values.arkAiNodeSelector }}
+        {{ $label._0 }}: "{{ $label._1 }}"
+{{- end }} # <--- End of conditional block        
+      containers:
+        - name: {{ .Chart.Name }}
+          image: {{ .Values.image }}
+          imagePullPolicy:  {{ .Values.containerImagePullPolicy }}
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              memory: {{ .Values.arkAiMemoryRequest }}
+              cpu: {{ .Values.arkAiCPURequest }}
+            limits:
+              memory: {{ .Values.arkAiMemoryLimit }}
+              cpu: {{ .Values.arkAiCPULimit }}
