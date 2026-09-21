@@ -187,7 +187,7 @@ def _find_outer_clause(sql: str) -> int | None:
 # ─────────────────────────────────────────────
 # Ministry filter injection
 # ─────────────────────────────────────────────
-def _inject_ministry_filter(sql: str, entities: dict) -> str:
+def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = None) -> str:
     """
     1. Scrubs any hallucinated ministry/ID filter the LLM added
     2. Injects deterministic ministry filters from extracted entities
@@ -205,6 +205,10 @@ def _inject_ministry_filter(sql: str, entities: dict) -> str:
     if not entities:
         return sql
 
+    spec = query_spec or {}
+    # A resolved canonical Salesforce id is authoritative; raw text is only a
+    # fallback for legacy non-resolved requests.
+    canonical_id = _sanitize_ministry_code(spec.get("entity_id"))
     code = _sanitize_ministry_code(entities.get("ministry_code"))
     name = _sanitize_ministry_name(entities.get("ministry_name"))
 
@@ -215,7 +219,9 @@ def _inject_ministry_filter(sql: str, entities: dict) -> str:
     # ── Step 2: Build conditions ──
     conditions = []
 
-    if code:
+    if canonical_id:
+        conditions.append(f"m.sfid = '{canonical_id}'")
+    elif code:
         conditions.append(f"UPPER(m.giftcode) = '{code.upper()}'")
 
     if name:
@@ -275,6 +281,7 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
     question       = state["question"]
     intent         = state.get("intent", "")
     entities       = state.get("entities", {})
+    query_spec     = state.get("query_spec", {})
     history        = state.get("session_history", [])
     retry_count    = state.get("retry_count", 0)
     retry_feedback = state.get("llm_validation_feedback", "") if retry_count > 0 else ""
@@ -287,7 +294,7 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
         # History is NOT passed to SQL generation because the question has
         # already been expanded/contextualized in the prior node (~500-1000
         # tokens saved).
-        messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None)
+        messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None, query_spec=query_spec)
         messages = [
             SystemMessage(content=messages_raw[0]["content"]),
             HumanMessage(content=messages_raw[1]["content"]),
@@ -315,7 +322,7 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
             }
 
         # ── Scrub hallucinations + inject ministry filter ──
-        final_sql = _inject_ministry_filter(raw_sql, entities)
+        final_sql = _inject_ministry_filter(raw_sql, entities, query_spec)
 
         # ── Domain guard validation ──
         is_safe, reason = domain_guard.check_sql(final_sql)

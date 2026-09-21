@@ -146,16 +146,32 @@ def _check_columns(sql: str, alias_map: dict[str, str]) -> tuple[bool, str]:
 
 # ── Name detection fallback ─────────────────────────────────────────────────
 def _looks_like_person_name(q: str) -> bool:
+    # This fallback is deliberately conservative.  Treating every short
+    # alphabetic phrase as a name causes ordinary requests such as
+    # "Tell me a joke" to enter the donor SQL path.
     tokens = q.strip().split()
-    if not (1 <= len(tokens) <= 4):
+    if not (1 <= len(tokens) <= 3):
         return False
-    return all(token.isalpha() for token in tokens)
+    return all(token.isalpha() and token[:1].isupper() for token in tokens)
+
+
+_FOLLOW_UP_INTENT_RE = re.compile(
+    r"^\s*(?:what|how)\s+about\b|^\s*(?:and|also|then)\b|"
+    r"\b(?:last|this|previous)\s+(?:month|week|year)\b",
+    re.IGNORECASE,
+)
 
 
 # ── Layer 1: keyword-based classifier ───────────────────────────────────────
 def _classify_intent_keywords(question: str) -> str:
     q = question.lower()
     intent_keywords = get_intent_keyword_map()
+
+    # Relative temporal follow-ups are valid donor-portal questions even when
+    # the subject is inherited from conversation history.  Let the normal
+    # follow-up/query-spec path resolve that omitted subject.
+    if _FOLLOW_UP_INTENT_RE.search(question):
+        return "aggregate"
 
     matched = [
         intent for intent, keywords in intent_keywords.items()
@@ -166,7 +182,7 @@ def _classify_intent_keywords(question: str) -> str:
         specific = [m for m in matched if m != "aggregate"]
         return specific[0] if specific else "aggregate"
 
-    if _looks_like_person_name(q):
+    if _looks_like_person_name(question):
         logger.info(f"Name-based fallback triggered for: {q!r}")
         return "entity_lookup"
 

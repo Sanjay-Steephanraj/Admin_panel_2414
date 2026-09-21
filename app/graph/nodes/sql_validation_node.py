@@ -13,6 +13,7 @@ from data_masking import masker
 from llm.gloo_client import get_llm
 from llm.prompts import build_sql_validation_prompt
 from tools.db_tool import execute_query
+from components.query_spec import semantic_sql_errors
 
 logger = logging.getLogger(__name__)
 
@@ -287,6 +288,7 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
 
     sql      = state.get("generated_sql")
     question = state["question"]
+    query_spec = state.get("query_spec") or {}
 
     # ── Guard ────────────────────────────────────────────
     if not sql:
@@ -297,6 +299,14 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             "message":           None,
             "db_error":          "No SQL to validate",
         }
+
+    # ── Semantic contract validation happens before database execution. ──
+    semantic_errors = semantic_sql_errors(sql, query_spec)
+    if semantic_errors:
+        feedback = "SEMANTIC SQL MISMATCH:\n" + "\n".join(f"- {e}" for e in semantic_errors)
+        logger.warning("[sql_validation] %s", feedback)
+        return {**state, "validation_passed": False, "fallback_used": False,
+                "db_error": None, "message": None, "llm_validation_feedback": feedback}
 
     # ── STEP 1: Execute original query ───────────────────
     logger.info(f"[sql_validation] Executing SQL:\n{sql}")
@@ -318,40 +328,8 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
                 "llm_validation_feedback": "DB execution successful — LLM validation skipped",
             }
 
-        # CASE B: zero rows — attempt date-filter fallback
-        logger.info("[sql_validation] Zero rows — checking for date filter fallback")
-
-        if _has_date_filter(sql):
-            fallback_sql = remove_date_filter(sql)
-            logger.info(f"[sql_validation] Fallback SQL:\n{fallback_sql}")
-
-            fallback_result, fallback_error = execute_query(fallback_sql)
-
-            # Fallback SQL itself errored: do NOT pretend success. Log the
-            # warning and fall through to the empty-result path so the user
-            # sees the original zero-row result rather than a silent
-            # "no data found" that masks a broken fallback query.
-            if fallback_error is not None:
-                logger.warning(
-                    f"[sql_validation] Fallback SQL errored — reporting original "
-                    f"zero-row result. fallback_error={fallback_error}"
-                )
-            elif fallback_result:
-                logger.info(f"[sql_validation] Fallback success | rows={len(fallback_result)}")
-                return {
-                    **state,
-                    "db_result":              fallback_result,
-                    "db_error":               None,
-                    "validation_passed":      True,
-                    "fallback_used":          True,    # ← THE key flag
-                    "message":                "No data found for the specified period. Showing overall contributions instead.",
-                    "llm_validation_feedback": "Fallback applied — date filter removed",
-                }
-            else:
-                logger.info("[sql_validation] Fallback also returned no rows")
-
-        # CASE C: no data even after fallback
-        logger.info("[sql_validation] No data found")
+        # A valid zero-row query is final. Never remove requested filters.
+        logger.info("[sql_validation] No data found; preserving original query contract")
         return {
             **state,
             "db_result":              [],
@@ -359,6 +337,7 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             "validation_passed":      True,
             "fallback_used":          False,           # ← explicit
             "message":                "No contributions found for the given query.",
+            "query_outcome":          "no_results",
             "llm_validation_feedback": "Query valid but returned no data",
         }
 

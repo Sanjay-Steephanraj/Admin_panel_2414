@@ -98,6 +98,7 @@ def build_sql_generation_prompt(
     intent: str = "",
     retry_feedback: str = "",
     history: list[dict] = None,
+    query_spec: dict | None = None,
 ) -> list[dict]:
 
     safe_question = _sanitize_question(question)
@@ -114,10 +115,19 @@ def build_sql_generation_prompt(
 
     history_block = format_history_block(history or [])
 
+    contract = query_spec or {}
     system = f"""{DOMAIN_CONTEXT}
 
 You are an internal MySQL query engine for this system.
 Convert the admin's natural language question into a precise MySQL SELECT query.
+
+AUTHORITATIVE QUERY SPECIFICATION (do not reinterpret it):
+{contract}
+The specification's resolved ministry identity, entity role, metric, grouping,
+status, and absolute start_date/exclusive_end_date are mandatory. Relative dates
+have already been resolved. Do not broaden filters. Use sfpayments for recorded
+donation/payment analytics; a receiving ministry joins sfpayments.ministryid to
+sf_ministries.sfid. For all_time add no paymentdate predicate.
 
 {schema_block}
 

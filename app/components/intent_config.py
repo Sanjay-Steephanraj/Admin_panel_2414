@@ -95,7 +95,7 @@ INTENTS: list[dict] = [
             "highest", "lowest",
             "monthly", "yearly",
             "report", "summary", "breakdown",
-            "compare", "rank"
+            "compare", "rank", "revenue", "income", "raised"
         ],
         "tables": [],
         "join_hint": "",

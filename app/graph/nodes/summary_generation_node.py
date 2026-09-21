@@ -3,6 +3,7 @@ graph/nodes/summary_generation_node.py
 """
 
 import logging
+from decimal import Decimal, InvalidOperation
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..states.nlsql_state import NLSQLState
@@ -33,6 +34,7 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
     error         = state.get("error")
     fallback_used = state.get("fallback_used", False)
     fallback_msg  = state.get("message")
+    query_spec    = state.get("query_spec") or {}
 
     # ── Debug log — confirms what actually arrived ────────
     logger.info(
@@ -52,7 +54,18 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
 
     # ── No data at all ────────────────────────────────────
     if not db_result:
-        return {**state, "summary": user_error_message("no_results")}
+        period = query_spec.get("period_name")
+        suffix = f" for {period.replace('_', ' ')}" if period and period != "unspecified" else ""
+        return {**state, "summary": f"No recorded payments found{suffix}."}
+
+    # Detail and grouped reports are data products, not prose summaries.  The
+    # full approved DB result is rendered deterministically so an LLM cannot
+    # silently select the first 15 rows.
+    if query_spec.get("result_shape") in {"detail", "grouped"}:
+        return {**state, "summary": _markdown_table(db_result, query_spec)}
+
+    if query_spec.get("result_shape") == "scalar":
+        return {**state, "summary": _scalar_result(db_result, query_spec)}
 
     # ── Fallback: deterministic template, zero LLM ───────
     if fallback_used:
@@ -178,3 +191,51 @@ def _build_fallback_summary(rows: list, fallback_msg: str | None) -> str:
     except Exception:
         logger.exception("[summary_node] _build_fallback_summary failed")
         return fallback_msg or "Data available but could not be formatted."
+
+
+def _markdown_table(rows: list[dict], spec: dict) -> str:
+    """Render every returned row. Query LIMIT, not the responder, is the cap."""
+    headers = list(rows[0].keys()) if rows else []
+    if not headers:
+        return "No recorded payments found."
+    title = "Payment details" if spec.get("result_shape") == "detail" else "Payments by ministry"
+    def cell(value):
+        if value is None: return ""
+        return str(value).replace("|", "\\|").replace("\n", " ")
+    lines = [f"{title} ({len(rows)} rows):", "", "| " + " | ".join(h.replace("_", " ").title() for h in headers) + " |",
+             "| " + " | ".join("---" for _ in headers) + " |"]
+    lines.extend("| " + " | ".join(cell(row.get(h)) for h in headers) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _scalar_result(rows: list[dict], spec: dict) -> str:
+    row = rows[0] if rows else {}
+    metric = spec.get("metric") or "result"
+    # SQL may include a descriptive column before the aggregate, e.g.
+    # ``ministry_name, SUM(...)``. Select the aggregate by its column name or
+    # numeric value rather than assuming the first column is the answer.
+    value = None
+    metric_tokens = {
+        "total": ("total", "sum", "amount", "contribution", "raised", "income"),
+        "average": ("avg", "average", "amount"),
+        "count": ("count", "number", "total"),
+    }.get(metric, ())
+    for key, candidate in row.items():
+        key_lower = str(key).lower()
+        if any(token in key_lower for token in metric_tokens):
+            value = candidate
+            break
+    if value is None:
+        for candidate in row.values():
+            try:
+                Decimal(str(candidate))
+                value = candidate
+                break
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+    if value is None:
+        value = 0
+    if metric in {"total", "average"}:
+        try: value = f"${Decimal(str(value)):,.2f}"
+        except Exception: pass
+    return f"{metric.title()}: **{value}**"

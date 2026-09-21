@@ -16,6 +16,8 @@ from config.settings import get_settings
 from security.domain_guard import domain_guard
 from llm.prompts import is_ambiguous, user_error_message
 from components.query_normalizer import normalize_question, detect_name_ambiguity
+from components.query_spec import build_query_spec, merge_follow_up, resolve_ministry
+from llm.question_expander import is_genuine_follow_up
 from tools.db_tool import ping_db
 from cache.query_cache import query_cache, _get_redis
 from cache.session_store import session_store
@@ -179,6 +181,7 @@ async def _run_sync(fn, *args, **kwargs):
 #  API endpoints 
 
 @app.post("/chat/query", response_model=AskResponse)
+@app.post("/api/chat/query", response_model=AskResponse, include_in_schema=False)
 async def ask(request: AskRequest):
     request_id = str(uuid.uuid4())
     logger.info(f"[{request_id}] {request.question}")
@@ -241,10 +244,22 @@ async def ask(request: AskRequest):
             session_id=session_id,
         )
 
-    # ── Normalisation + entity extraction ──
+    # ── Normalisation + authoritative query specification ──
     norm_output = await _run_sync(normalize_question, expanded_question)
     normalized_question = norm_output["normalized_question"]
     entities            = norm_output["entities"]
+    query_spec = build_query_spec(normalized_question, entities)
+    if is_genuine_follow_up(request.question):
+        previous = next((t.get("query_spec") for t in reversed(history) if t.get("query_spec")), None)
+        query_spec = merge_follow_up(query_spec, previous)
+    query_spec, resolution_clarification = await _run_sync(resolve_ministry, query_spec)
+    if resolution_clarification:
+        return AskResponse(response=resolution_clarification, question=request.question, row_count=0,
+                           cache_hit=False, request_id=request_id, session_id=session_id)
+    if query_spec.get("resolution_outcome") == "no_match":
+        name = query_spec.get("entity_name") or query_spec.get("entity_code") or "that ministry"
+        return AskResponse(response=f'No ministry record matches "{name}".', question=request.question, row_count=0,
+                           cache_hit=False, request_id=request_id, session_id=session_id)
 
     logger.info(f"Normalized Question: {normalized_question}")
     logger.info(f"Entities: {entities}")
@@ -314,6 +329,7 @@ async def ask(request: AskRequest):
             entities,
             session_id=session_id,
             history=history,
+            query_spec=query_spec,
         )
     except Exception:
         logger.exception(f"[{request_id}] Pipeline error")
@@ -350,12 +366,13 @@ async def ask(request: AskRequest):
     # ── Save History (on success) ──
     # When Redis is disabled, the record_turn graph node already persisted
     # the turn via the MemorySaver checkpointer, so nothing to do here.
-    if get_settings().redis_enabled and state.get("validation_passed") and state.get("summary") and not state.get("error"):
+    if get_settings().redis_enabled and state.get("validation_passed") and state.get("db_result") and state.get("summary") and not state.get("error"):
         turn = {
             "question": normalized_question,
             "sql":      state.get("generated_sql"),
             "summary":  state.get("summary"),
             "ts":       datetime.utcnow().isoformat(),
+            "query_spec": state.get("query_spec"),
         }
         await _run_sync(session_store.append, session_id, turn)
 

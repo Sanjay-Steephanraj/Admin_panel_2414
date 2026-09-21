@@ -83,6 +83,7 @@ def record_turn(state: dict) -> dict:
     """
     if (
         state.get("validation_passed")
+        and state.get("db_result")
         and state.get("summary")
         and not state.get("error")
     ):
@@ -92,6 +93,7 @@ def record_turn(state: dict) -> dict:
             "sql":      state.get("generated_sql"),
             "summary":  state.get("summary"),
             "ts":       datetime.utcnow().isoformat(),
+            "query_spec": state.get("query_spec"),
         }
         history = (state.get("session_history") or []) + [turn]
         return {"session_history": history[-MAX_TURNS:]}

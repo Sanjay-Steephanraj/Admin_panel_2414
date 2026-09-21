@@ -76,6 +76,7 @@ def run_nlsql_pipeline(
     entities: dict = None,
     session_id: str = None,
     history: list[dict] = None,
+    query_spec: dict = None,
 ) -> NLSQLState:
     redis_on = get_settings().redis_enabled
 
@@ -125,6 +126,9 @@ def run_nlsql_pipeline(
         "cache_hit":               False,
         "error":                   None,
         "trace_id":                None,
+        "query_spec":              query_spec or {},
+        "last_successful_query_spec": None,
+        "query_outcome":           None,
     }
 
     logger.info(f"Pipeline start | intent={intent} | question={question!r}")
