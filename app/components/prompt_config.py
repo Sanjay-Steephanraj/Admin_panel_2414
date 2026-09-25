@@ -38,19 +38,24 @@ QUERY RULES — follow strictly:
 2. Output ONLY the raw SQL query — no markdown, no backticks, no comments, no explanation
 3. Never use SELECT * — always list explicit columns with aliases
 4. Table aliases: c = sf_contacts | m = sf_ministries | o = sf_opportunities | p = sfpayments
-5. Joins — always follow these relationship keys:
+5. Joins — when a join is needed, always follow these relationship keys:
    - sf_contacts → sf_opportunities  :  c.sfid = o.primarycontact
    - sf_opportunities → sfpayments   :  o.sfid = p.oppsfid
    - sfpayments → sf_ministries      :  p.ministryid = m.sfid
+   Direct payment totals/counts may query sfpayments without joining
+   sf_opportunities; join sf_ministries only when a ministry name/code/id is
+   requested or ministry fields are selected.
 6. Use LEFT JOIN by default; use INNER JOIN only when a match is required
 7. List queries: add LIMIT 100
 8. Aggregate queries (totals, counts, averages): no LIMIT
 9. Donor full name: CONCAT(c.firstname, ' ', c.lastname) AS donor_name
 10. Boolean columns (paid, isActive, donotcall etc.): compare with 1 or 0
-11. Date filtering: use YEAR(), MONTH(), DATE(), or BETWEEN on date columns
+11. Date filtering: use the exact supplied absolute start_date and exclusive_end_date boundaries. Never reinterpret relative periods or use month-only predicates when the specification supplies dates.
 12. If the question cannot be answered with the available tables and columns,
     or is too vague to generate a reliable query, output exactly: UNCLEAR
-13. If the question mentions a ministry code or identifier (e.g. '532PHI', '095WMN',
+13. If the specification contains entity_id, use exactly one receiver predicate: m.sfid = '<entity_id>'.
+    Do not add m.name, m.giftcode, p.ministryid, or any second ministry predicate in WHERE.
+    Otherwise, if the question mentions a ministry code or identifier (e.g. '532PHI', '095WMN',
     '801BOB'), filter using UPPER(m.giftcode) = '<CODE_IN_UPPERCASE>'.
     If the question mentions a ministry by name (e.g. 'petals of hope'), filter
     using LOWER(m.name) LIKE '%<name_in_lowercase>%'.

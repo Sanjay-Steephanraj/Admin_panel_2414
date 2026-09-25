@@ -34,6 +34,10 @@ def expand_question(question: str, history: list[dict]) -> str:
         logger.info("Question is self-contained; skipping follow-up expansion")
         return question
 
+    # Follow-up inheritance is deterministic in query_spec.merge_follow_up.
+    # Do not let an LLM rewrite the current message or copy stale filters.
+    return question
+
     # ── Mask PII in question + history before sending to LLM ──────────────
     # Fail-closed: if masking raises, never send unmasked data — return original.
     try:

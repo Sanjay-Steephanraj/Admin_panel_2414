@@ -18,7 +18,7 @@ MAX_RETRIES = 2
 #       filters are not stripped.
 # ─────────────────────────────────────────────
 _LLM_HALLUCINATION_PATTERN = re.compile(
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
     re.IGNORECASE,
 )
 
@@ -27,7 +27,7 @@ _LLM_HALLUCINATION_PATTERN = re.compile(
 # connector, so OR-branch tautologies like "OR 1=1" can never be produced.
 _HALLUCINATION_LEADING_CONNECTOR_RE = re.compile(
     r"\s+(?:AND|OR)\s+"
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?"
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?"
     r"(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
     re.IGNORECASE,
 )
@@ -35,7 +35,7 @@ _HALLUCINATION_LEADING_CONNECTOR_RE = re.compile(
 # Hallucinated condition WITH a trailing boolean connector — handles the
 # case where the hallucination is the FIRST condition after WHERE.
 _HALLUCINATION_TRAILING_CONNECTOR_RE = re.compile(
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?"
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?"
     r"(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')\s+(?:AND|OR)\s+",
     re.IGNORECASE,
 )
@@ -49,6 +49,7 @@ _HALLUCINATION_TRAILING_CONNECTOR_RE = re.compile(
 # so this is the trust boundary for these values.
 # ─────────────────────────────────────────────
 _SAFE_CODE_RE = re.compile(r"[^A-Za-z0-9_]")
+_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9 \-&.,']")
 
 
@@ -202,15 +203,15 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
     - both       → OR-combined so either match succeeds
     """
 
-    if not entities:
-        return sql
-
     spec = query_spec or {}
     # A resolved canonical Salesforce id is authoritative; raw text is only a
     # fallback for legacy non-resolved requests.
-    canonical_id = _sanitize_ministry_code(spec.get("entity_id"))
-    code = _sanitize_ministry_code(entities.get("ministry_code"))
-    name = _sanitize_ministry_name(entities.get("ministry_name"))
+    canonical_raw = spec.get("resolved_entity_id") or spec.get("entity_id")
+    canonical_id = _SAFE_ID_RE.sub("", str(canonical_raw))[:128] if canonical_raw else None
+    entities = entities or {}
+    # Once resolved, the canonical ID is the sole authoritative filter.
+    code = None if canonical_id else _sanitize_ministry_code(entities.get("ministry_code"))
+    name = None if canonical_id else _sanitize_ministry_name(entities.get("ministry_name"))
 
     # ── Step 1: Remove hallucinated LLM filters ──
     sql = _scrub_hallucinated_conditions(sql)
@@ -219,7 +220,7 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
     # ── Step 2: Build conditions ──
     conditions = []
 
-    if canonical_id:
+    if canonical_id and spec.get("entity_role") == "receiving_ministry":
         conditions.append(f"m.sfid = '{canonical_id}'")
     elif code:
         conditions.append(f"UPPER(m.giftcode) = '{code.upper()}'")
@@ -231,7 +232,7 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
         logger.info("Ministry filter injected | code=None name=None")
         return sql
 
-    logger.info(f"Ministry filter injected | code={code!r} name={name!r}")
+    logger.info(f"Ministry filter injected | canonical_id={canonical_id!r} code={code!r} name={name!r}")
 
     # OR when both present — tolerates partial user input
     ministry_filter = (

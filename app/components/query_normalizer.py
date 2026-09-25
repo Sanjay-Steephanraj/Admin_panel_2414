@@ -56,7 +56,8 @@ _COMPILED_PATTERNS = [
 _LEADING_STOPWORDS = re.compile(
     r"^(?:by|for|from|of|in|at|the|and|or|is|are|was|were|"
     r"made|what|show|get|list|all|about|regarding|related|to|"
-    r"did|do|does|contributions?|payments?|donations?|gifts?|transactions?)\s+",
+    r"did|do|does|received?|request(?:ed)?|details?|contributions?|payments?|"
+    r"donations?|gifts?|transactions?)\s+",
     flags=re.IGNORECASE,
 )
 
@@ -77,6 +78,12 @@ _CODE_BARE_RE = re.compile(
 # Ministry name: 1-4 words directly before "ministry"
 _NAME_RE = re.compile(
     r"\b((?:[A-Za-z]+\s+){1,4}?ministry)\b",
+    re.IGNORECASE,
+)
+_MINISTRY_OF_RE = re.compile(
+    r"\bministry\s+(?:of|to|for)\s+((?:[A-Za-z]+\s+){0,3}?[A-Za-z]+)"
+    r"(?=\s+(?:got|gets|received|receives|donated|donations?|payments?|"
+    r"contributions?|in|for|from|during|over|this|last|all)\b|$)",
     re.IGNORECASE,
 )
 
@@ -140,12 +147,29 @@ def _regex_extract(question: str) -> dict:
             prev      = candidate
             candidate = _LEADING_STOPWORDS.sub("", candidate).strip()
 
+        candidate = re.sub(r"\s+ministry$", "", candidate, flags=re.IGNORECASE).strip()
+
         candidate_lower = candidate.lower()
 
         if candidate_lower and candidate_lower not in _STOPWORD_NAMES:
             name = candidate_lower
             # High confidence only if the phrase is ≤ 3 words
             name_high = len(candidate.split()) <= 3
+    # Also support the common database naming form "Ministry of <name>".
+    # This branch runs only when the suffix form above did not produce a name.
+    if _MINISTRY_OF_RE.search(question):
+        of_match = _MINISTRY_OF_RE.search(question)
+        if of_match:
+            candidate = of_match.group(1).strip()
+            candidate = re.split(
+                r"\s+(?:in|for|from|to|during|over|this|last|all)\b",
+                candidate,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" ,.?\")'")
+            if candidate:
+                name = candidate.lower()
+                name_high = len(candidate.split()) <= 3
         # else name stays None — don't inject a bad filter
 
     # ── Confidence decision ──

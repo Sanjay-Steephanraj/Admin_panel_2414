@@ -36,6 +36,8 @@ class NLSQLState(TypedDict, total=False):
 
     # Cache
     cache_hit:              bool
+    displayed_count:        int
+    total_count:            int
 
     # Error passthrough
     error:                  Optional[str]

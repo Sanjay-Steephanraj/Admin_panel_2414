@@ -44,6 +44,13 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
         f"message={fallback_msg}"
     )
 
+    # A persistent semantic mismatch must never be presented as an empty or
+    # partially summarized result after the retry budget is exhausted.
+    if (not state.get("validation_passed", False)
+            and state.get("retry_count", 0) >= 2):
+        return {**state, "summary": user_error_message("db_failure"),
+                "query_outcome": "retrieval_error"}
+
     # ── Hard stop (security / unclear intent) ────────────
     if error and not sql:
         return {**state, "summary": error}
@@ -54,15 +61,23 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
 
     # ── No data at all ────────────────────────────────────
     if not db_result:
+        ministry = query_spec.get("resolved_entity_name") or query_spec.get("entity_name")
+        donor = query_spec.get("entity_name") if query_spec.get("entity_role") == "donor" else None
         period = query_spec.get("period_name")
-        suffix = f" for {period.replace('_', ' ')}" if period and period != "unspecified" else ""
-        return {**state, "summary": f"No recorded payments found{suffix}."}
+        period_text = "this month" if period == "this_month" else (period.replace("_", " ") if period and period != "unspecified" else "the requested period")
+        subject = f" for {ministry}" if ministry else (f" for {donor}" if donor else "")
+        return {**state, "summary": f"No recorded payments were found{subject} {period_text}."}
 
     # Detail and grouped reports are data products, not prose summaries.  The
     # full approved DB result is rendered deterministically so an LLM cannot
     # silently select the first 15 rows.
     if query_spec.get("result_shape") in {"detail", "grouped"}:
-        return {**state, "summary": _markdown_table(db_result, query_spec)}
+        summary = _markdown_table(db_result, query_spec)
+        displayed = state.get("displayed_count") or len(db_result)
+        total = state.get("total_count") or displayed
+        if total > displayed:
+            summary = f"Showing {displayed} of {total} records.\n\n" + summary
+        return {**state, "summary": summary}
 
     if query_spec.get("result_shape") == "scalar":
         return {**state, "summary": _scalar_result(db_result, query_spec)}
@@ -220,19 +235,8 @@ def _scalar_result(rows: list[dict], spec: dict) -> str:
         "average": ("avg", "average", "amount"),
         "count": ("count", "number", "total"),
     }.get(metric, ())
-    for key, candidate in row.items():
-        key_lower = str(key).lower()
-        if any(token in key_lower for token in metric_tokens):
-            value = candidate
-            break
-    if value is None:
-        for candidate in row.values():
-            try:
-                Decimal(str(candidate))
-                value = candidate
-                break
-            except (InvalidOperation, TypeError, ValueError):
-                continue
+    required_alias = {"total": "total_amount", "average": "average_amount", "count": "record_count"}.get(metric)
+    value = row.get(required_alias) if required_alias else None
     if value is None:
         value = 0
     if metric in {"total", "average"}:

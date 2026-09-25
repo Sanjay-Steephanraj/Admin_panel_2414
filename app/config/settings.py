@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # App
     app_env: str = "development"
     app_secret_key: str = "changeme"
+    reporting_timezone: str = "Asia/Calcutta"
 
     class Config:
         env_file = ".env"

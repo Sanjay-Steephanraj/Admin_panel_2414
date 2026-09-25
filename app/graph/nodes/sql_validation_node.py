@@ -227,6 +227,10 @@ def remove_date_filter(sql: str) -> str:
     WHERE with no condition. Idempotent. Returns input unchanged if nothing
     matched.
     """
+    # Retained as a compatibility shim only. Date widening is forbidden by the
+    # query contract and this function must never change executable SQL.
+    return sql
+
     region = _find_outer_where_region(sql)
     if region is None:
         return sql
@@ -317,6 +321,16 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
 
         # CASE A: rows found — happy path
         if db_result:
+            displayed_count = len(db_result)
+            total_count = displayed_count
+            limit_match = re.search(r"\blimit\s+(\d+)\s*;?\s*$", sql, re.IGNORECASE)
+            if limit_match and displayed_count >= int(limit_match.group(1)):
+                base_sql = re.sub(r"\s+limit\s+\d+\s*;?\s*$", "", sql, flags=re.IGNORECASE).strip().rstrip(";")
+                count_rows, count_error = execute_query(
+                    f"SELECT COUNT(*) AS total_count FROM ({base_sql}) AS _counted"
+                )
+                if not count_error and count_rows:
+                    total_count = int(count_rows[0].get("total_count") or displayed_count)
             logger.info(f"[sql_validation] Success | rows={len(db_result)}")
             return {
                 **state,
@@ -326,6 +340,8 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
                 "fallback_used":          False,       # ← explicit
                 "message":                None,
                 "llm_validation_feedback": "DB execution successful — LLM validation skipped",
+                "displayed_count": displayed_count,
+                "total_count": total_count,
             }
 
         # A valid zero-row query is final. Never remove requested filters.
@@ -338,6 +354,8 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             "fallback_used":          False,           # ← explicit
             "message":                "No contributions found for the given query.",
             "query_outcome":          "no_results",
+            "displayed_count":        0,
+            "total_count":             0,
             "llm_validation_feedback": "Query valid but returned no data",
         }
 
@@ -360,6 +378,7 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             generated_sql=masked_sql,
             db_error=masked_err,
             db_result_sample=db_result_sample,
+            query_spec=query_spec,
         )
 
         messages = [

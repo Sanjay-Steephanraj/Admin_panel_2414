@@ -152,13 +152,20 @@ def build_sql_validation_prompt(
     generated_sql: str,
     db_error: str,
     db_result_sample: str,
+    query_spec: dict | None = None,
 ) -> list[dict]:
 
     safe_question = _sanitize_question(question)
     schema_block  = get_active_schema_prompt_block()
 
     system = f"""You are an internal MySQL query reviewer.
-A SQL query was executed and returned an error. Diagnose and suggest a fix.
+A SQL query was executed and returned an error or failed semantic validation. Diagnose and suggest a fix.
+The structured query specification is authoritative. Repair missing or changed
+entity role, canonical ministry constraint, absolute period boundaries, aggregate,
+grouping, status, or result shape; executable SQL is not automatically correct.
+
+QUERY SPECIFICATION:
+{query_spec or {}}
 
 {schema_block}
 
@@ -190,12 +197,9 @@ def build_summary_prompt(
 ) -> list[dict]:
 
     safe_question  = _sanitize_question(question)
-    result_sample  = db_result[:15]
+    result_sample  = db_result
     result_str     = "\n".join(str(row) for row in result_sample)
-    truncation     = (
-        f"\n(Showing top 15 of {len(db_result)} total records)"
-        if len(db_result) > 15 else ""
-    )
+    truncation = ""
 
     intent_guidance = get_summary_instruction(intent)
 
@@ -210,11 +214,12 @@ RESPONSE RULES:
 4. Format dates in readable form (e.g. January 15, 2025)
 5. ALWAYS use the '-' character for bullet points when presenting lists (Markdown standard).
 6. If no records found: say so clearly and suggest what to check
-7. Max 150 words unless data requires more
-8. NEVER mention SQL, queries, database, tables, columns, or technical terms
-9. Speak directly and confidently — do not say "based on the data"
-10. Be kind and interactive, talking to the admin as a helpful assistant, not a distant engine
-11. Give the final response in valid markdown format, no spacing for ** when used for bold text
+7. The application renders detail/grouped rows deterministically; never select or omit records.
+8. Max 150 words for explanatory text unless the structured result requires more
+9. NEVER mention SQL, queries, database, tables, columns, or technical terms
+10. Speak directly and confidently — do not say "based on the data"
+11. Be kind and interactive, talking to the admin as a helpful assistant, not a distant engine
+12. Give the final response in valid markdown format, no spacing for ** when used for bold text
 """
     user = f"""Admin Question: {safe_question}
 

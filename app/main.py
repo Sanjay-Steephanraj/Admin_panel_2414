@@ -148,6 +148,8 @@ class AskResponse(BaseModel):
     response: str
     question: str
     row_count: int
+    displayed_count: int = 0
+    total_count: int = 0
     cache_hit: bool
     request_id: str
     session_id: str
@@ -252,6 +254,9 @@ async def ask(request: AskRequest):
     if is_genuine_follow_up(request.question):
         previous = next((t.get("query_spec") for t in reversed(history) if t.get("query_spec")), None)
         query_spec = merge_follow_up(query_spec, previous)
+    if query_spec.get("period_ambiguity"):
+        return AskResponse(response="Which year should I use for that month?", question=request.question,
+                           row_count=0, cache_hit=False, request_id=request_id, session_id=session_id)
     query_spec, resolution_clarification = await _run_sync(resolve_ministry, query_spec)
     if resolution_clarification:
         return AskResponse(response=resolution_clarification, question=request.question, row_count=0,
@@ -321,11 +326,12 @@ async def ask(request: AskRequest):
         )
 
     # ── Pipeline execution ──
+    effective_intent = "payment" if query_spec.get("subject") == "payment" else intent
     try:
         state = await _run_sync(
             run_nlsql_pipeline,
             normalized_question,
-            intent,
+            effective_intent,
             entities,
             session_id=session_id,
             history=history,
@@ -366,24 +372,39 @@ async def ask(request: AskRequest):
     # ── Save History (on success) ──
     # When Redis is disabled, the record_turn graph node already persisted
     # the turn via the MemorySaver checkpointer, so nothing to do here.
-    if get_settings().redis_enabled and state.get("validation_passed") and state.get("db_result") and state.get("summary") and not state.get("error"):
+    if get_settings().redis_enabled and state.get("validation_passed") and (state.get("db_result") or state.get("cache_hit")) and state.get("summary") and not state.get("error"):
         turn = {
             "question": normalized_question,
             "sql":      state.get("generated_sql"),
             "summary":  state.get("summary"),
             "ts":       datetime.utcnow().isoformat(),
             "query_spec": state.get("query_spec"),
+            "displayed_count": state.get("displayed_count") or len(db_result),
+            "total_count": state.get("total_count") or len(db_result),
         }
         await _run_sync(session_store.append, session_id, turn)
 
     return AskResponse(
         response=response,
         question=request.question,
-        row_count=len(db_result),
+        row_count=state.get("displayed_count") or len(db_result),
+        displayed_count=state.get("displayed_count") or len(db_result),
+        total_count=state.get("total_count") or len(db_result),
         cache_hit=cache_hit,
         request_id=request_id,
         session_id=session_id,
     )
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "Donor Portal AI",
+        "status": "ok",
+        "docs": "/docs",
+        "health": "/health",
+        "chat_endpoint": "POST /chat/query",
+    }
 
 
 @app.get("/health", response_model=HealthResponse)

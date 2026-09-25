@@ -79,10 +79,11 @@ def run_nlsql_pipeline(
     query_spec: dict = None,
 ) -> NLSQLState:
     redis_on = get_settings().redis_enabled
+    spec_key = question + "|resolved_dates=" + str((query_spec or {}).get("start_date")) + ":" + str((query_spec or {}).get("exclusive_end_date"))
 
     # ── Cache check ───────────────────────────
     if redis_on:
-        cached = query_cache.get(question)
+        cached = query_cache.get(spec_key)
         if cached:
             logger.info(f" Cache hit: {question!r}")
             return NLSQLState(
@@ -104,6 +105,11 @@ def run_nlsql_pipeline(
                 cache_hit=               True,
                 error=                   None,
                 trace_id=                None,
+                query_spec=              cached.query_spec or query_spec or {},
+                displayed_count=         cached.displayed_count or cached.row_count,
+                total_count=              cached.total_count or cached.row_count,
+                last_successful_query_spec=None,
+                query_outcome=           "success",
             )
 
     # ── Run graph ─────────────────────────────
@@ -129,6 +135,8 @@ def run_nlsql_pipeline(
         "query_spec":              query_spec or {},
         "last_successful_query_spec": None,
         "query_outcome":           None,
+        "displayed_count":         0,
+        "total_count":              0,
     }
 
     logger.info(f"Pipeline start | intent={intent} | question={question!r}")
@@ -151,10 +159,13 @@ def run_nlsql_pipeline(
         and not final_state.get("error")
     ):
         stored = query_cache.set(
-            question=  question,
+            question=  spec_key,
             sql=       final_state["generated_sql"],
             summary=   final_state["summary"],
             row_count= len(final_state.get("db_result") or []),
+            displayed_count=final_state.get("displayed_count") or len(final_state.get("db_result") or []),
+            total_count=final_state.get("total_count") or len(final_state.get("db_result") or []),
+            query_spec=final_state.get("query_spec") or query_spec or {},
         )
         if stored:
             logger.info("Result stored in cache")
