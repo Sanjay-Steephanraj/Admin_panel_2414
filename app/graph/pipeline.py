@@ -1,5 +1,7 @@
 import logging
 import uuid
+import hashlib
+import json
 from langgraph.graph import StateGraph, END
 
 from config.settings import get_settings
@@ -10,6 +12,12 @@ from .nodes.summary_generation_node import summary_generation_node
 from cache.query_cache import query_cache
 
 logger = logging.getLogger(__name__)
+
+def contract_cache_key(question: str, query_spec: dict | None) -> str:
+    payload = json.dumps({"question": " ".join(question.lower().split()),
+                          "query_spec": query_spec or {}}, sort_keys=True,
+                         separators=(",", ":"), ensure_ascii=False)
+    return "contract-v2:" + hashlib.sha256(payload.encode()).hexdigest()
 
 MAX_RETRIES = 2
 
@@ -55,11 +63,8 @@ def build_nlsql_graph():
         {"summary": "summary_generation", "retry": "increment_retry"},
     )
 
-    if redis_on:
-        graph.add_edge("summary_generation", END)
-        return graph.compile()
-
-    # Native LangGraph memory: record turn, persist via checkpointer
+    # Native LangGraph memory is the conversation backend in every mode.
+    # Redis is used only by the optional query cache above.
     from memory.conversation_memory import checkpointer, record_turn
     graph.add_node("record_turn", record_turn)
     graph.add_edge("summary_generation", "record_turn")
@@ -79,7 +84,7 @@ def run_nlsql_pipeline(
     query_spec: dict = None,
 ) -> NLSQLState:
     redis_on = get_settings().redis_enabled
-    spec_key = question + "|resolved_dates=" + str((query_spec or {}).get("start_date")) + ":" + str((query_spec or {}).get("exclusive_end_date"))
+    spec_key = contract_cache_key(question, query_spec)
 
     # ── Cache check ───────────────────────────
     if redis_on:
@@ -106,9 +111,8 @@ def run_nlsql_pipeline(
                 error=                   None,
                 trace_id=                None,
                 query_spec=              cached.query_spec or query_spec or {},
-                displayed_count=         cached.displayed_count or cached.row_count,
-                total_count=              cached.total_count or cached.row_count,
-                last_successful_query_spec=None,
+                displayed_count=         cached.displayed_count,
+                total_count=              cached.total_count,
                 query_outcome=           "success",
             )
 
@@ -133,8 +137,6 @@ def run_nlsql_pipeline(
         "error":                   None,
         "trace_id":                None,
         "query_spec":              query_spec or {},
-        "last_successful_query_spec": None,
-        "query_outcome":           None,
         "displayed_count":         0,
         "total_count":              0,
     }
@@ -157,14 +159,16 @@ def run_nlsql_pipeline(
         and final_state.get("generated_sql")
         and final_state.get("summary")
         and not final_state.get("error")
+        and not final_state.get("db_error")
+        and final_state.get("query_outcome") == "success"
     ):
         stored = query_cache.set(
             question=  spec_key,
             sql=       final_state["generated_sql"],
             summary=   final_state["summary"],
             row_count= len(final_state.get("db_result") or []),
-            displayed_count=final_state.get("displayed_count") or len(final_state.get("db_result") or []),
-            total_count=final_state.get("total_count") or len(final_state.get("db_result") or []),
+            displayed_count=final_state.get("displayed_count", len(final_state.get("db_result") or [])),
+            total_count=final_state.get("total_count", len(final_state.get("db_result") or [])),
             query_spec=final_state.get("query_spec") or query_spec or {},
         )
         if stored:

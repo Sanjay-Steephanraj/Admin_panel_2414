@@ -146,32 +146,16 @@ def _check_columns(sql: str, alias_map: dict[str, str]) -> tuple[bool, str]:
 
 # ── Name detection fallback ─────────────────────────────────────────────────
 def _looks_like_person_name(q: str) -> bool:
-    # This fallback is deliberately conservative.  Treating every short
-    # alphabetic phrase as a name causes ordinary requests such as
-    # "Tell me a joke" to enter the donor SQL path.
     tokens = q.strip().split()
-    if not (1 <= len(tokens) <= 3):
+    if not (1 <= len(tokens) <= 4):
         return False
-    return all(token.isalpha() and token[:1].isupper() for token in tokens)
-
-
-_FOLLOW_UP_INTENT_RE = re.compile(
-    r"^\s*(?:what|how)\s+about\b|^\s*(?:and|also|then)\b|"
-    r"\b(?:last|this|previous)\s+(?:month|week|year)\b",
-    re.IGNORECASE,
-)
+    return all(token.isalpha() for token in tokens)
 
 
 # ── Layer 1: keyword-based classifier ───────────────────────────────────────
 def _classify_intent_keywords(question: str) -> str:
     q = question.lower()
     intent_keywords = get_intent_keyword_map()
-
-    # Relative temporal follow-ups are valid donor-portal questions even when
-    # the subject is inherited from conversation history.  Let the normal
-    # follow-up/query-spec path resolve that omitted subject.
-    if _FOLLOW_UP_INTENT_RE.search(question):
-        return "aggregate"
 
     matched = [
         intent for intent, keywords in intent_keywords.items()
@@ -182,7 +166,7 @@ def _classify_intent_keywords(question: str) -> str:
         specific = [m for m in matched if m != "aggregate"]
         return specific[0] if specific else "aggregate"
 
-    if _looks_like_person_name(question):
+    if _looks_like_person_name(q):
         logger.info(f"Name-based fallback triggered for: {q!r}")
         return "entity_lookup"
 
@@ -270,7 +254,7 @@ def _classify_intent(question: str) -> str:
 class DomainGuard:
 
     @staticmethod
-    def check_question(question: str) -> tuple[bool, str, str]:
+    def check_question(question: str, *, contextual_intent: str | None = None) -> tuple[bool, str, str]:
         """Returns (is_safe, reason, intent)."""
         q = question.strip()
 
@@ -281,7 +265,10 @@ class DomainGuard:
             logger.warning(f"Injection blocked: {q!r}")
             return False, "injection", "off_topic"
 
-        intent = _classify_intent(q)
+        # Context is supplied only after injection checks and only for a
+        # verified follow-up with a successful prior specification.
+        intent = (contextual_intent if contextual_intent in _VALID_INTENTS - {"off_topic"}
+                  else _classify_intent(q))
 
         if intent == "off_topic":
             logger.warning(f"Off-topic blocked: {q!r}")

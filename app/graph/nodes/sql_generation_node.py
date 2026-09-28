@@ -6,6 +6,7 @@ from ..states.nlsql_state import NLSQLState
 from llm.gloo_client import get_llm
 from llm.prompts import build_sql_generation_prompt
 from security.domain_guard import domain_guard
+from components.sql_contract import enforce_entity_filter
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,7 @@ MAX_RETRIES = 2
 #       filters are not stripped.
 # ─────────────────────────────────────────────
 _LLM_HALLUCINATION_PATTERN = re.compile(
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
     re.IGNORECASE,
 )
 
@@ -27,7 +28,7 @@ _LLM_HALLUCINATION_PATTERN = re.compile(
 # connector, so OR-branch tautologies like "OR 1=1" can never be produced.
 _HALLUCINATION_LEADING_CONNECTOR_RE = re.compile(
     r"\s+(?:AND|OR)\s+"
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?"
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?"
     r"(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')",
     re.IGNORECASE,
 )
@@ -35,7 +36,7 @@ _HALLUCINATION_LEADING_CONNECTOR_RE = re.compile(
 # Hallucinated condition WITH a trailing boolean connector — handles the
 # case where the hallucination is the FIRST condition after WHERE.
 _HALLUCINATION_TRAILING_CONNECTOR_RE = re.compile(
-    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|name|giftcode|ministry_?id)\s*\)?"
+    r"(?:LOWER\(|UPPER\()?\s*\w+\.(?:sfid|giftcode|ministry_?id)\s*\)?"
     r"(?:\s*[=!<>]+\s*'[^']*'|\s+LIKE\s+'[^']*')\s+(?:AND|OR)\s+",
     re.IGNORECASE,
 )
@@ -49,7 +50,6 @@ _HALLUCINATION_TRAILING_CONNECTOR_RE = re.compile(
 # so this is the trust boundary for these values.
 # ─────────────────────────────────────────────
 _SAFE_CODE_RE = re.compile(r"[^A-Za-z0-9_]")
-_SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_\-]")
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9 \-&.,']")
 
 
@@ -188,7 +188,7 @@ def _find_outer_clause(sql: str) -> int | None:
 # ─────────────────────────────────────────────
 # Ministry filter injection
 # ─────────────────────────────────────────────
-def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = None) -> str:
+def _inject_ministry_filter(sql: str, entities: dict) -> str:
     """
     1. Scrubs any hallucinated ministry/ID filter the LLM added
     2. Injects deterministic ministry filters from extracted entities
@@ -203,15 +203,11 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
     - both       → OR-combined so either match succeeds
     """
 
-    spec = query_spec or {}
-    # A resolved canonical Salesforce id is authoritative; raw text is only a
-    # fallback for legacy non-resolved requests.
-    canonical_raw = spec.get("resolved_entity_id") or spec.get("entity_id")
-    canonical_id = _SAFE_ID_RE.sub("", str(canonical_raw))[:128] if canonical_raw else None
-    entities = entities or {}
-    # Once resolved, the canonical ID is the sole authoritative filter.
-    code = None if canonical_id else _sanitize_ministry_code(entities.get("ministry_code"))
-    name = None if canonical_id else _sanitize_ministry_name(entities.get("ministry_name"))
+    if not entities:
+        return sql
+
+    code = _sanitize_ministry_code(entities.get("ministry_code"))
+    name = _sanitize_ministry_name(entities.get("ministry_name"))
 
     # ── Step 1: Remove hallucinated LLM filters ──
     sql = _scrub_hallucinated_conditions(sql)
@@ -220,9 +216,7 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
     # ── Step 2: Build conditions ──
     conditions = []
 
-    if canonical_id and spec.get("entity_role") == "receiving_ministry":
-        conditions.append(f"m.sfid = '{canonical_id}'")
-    elif code:
+    if code:
         conditions.append(f"UPPER(m.giftcode) = '{code.upper()}'")
 
     if name:
@@ -232,7 +226,7 @@ def _inject_ministry_filter(sql: str, entities: dict, query_spec: dict | None = 
         logger.info("Ministry filter injected | code=None name=None")
         return sql
 
-    logger.info(f"Ministry filter injected | canonical_id={canonical_id!r} code={code!r} name={name!r}")
+    logger.info(f"Ministry filter injected | code={code!r} name={name!r}")
 
     # OR when both present — tolerates partial user input
     ministry_filter = (
@@ -282,7 +276,6 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
     question       = state["question"]
     intent         = state.get("intent", "")
     entities       = state.get("entities", {})
-    query_spec     = state.get("query_spec", {})
     history        = state.get("session_history", [])
     retry_count    = state.get("retry_count", 0)
     retry_feedback = state.get("llm_validation_feedback", "") if retry_count > 0 else ""
@@ -295,7 +288,7 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
         # History is NOT passed to SQL generation because the question has
         # already been expanded/contextualized in the prior node (~500-1000
         # tokens saved).
-        messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None, query_spec=query_spec)
+        messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None)
         messages = [
             SystemMessage(content=messages_raw[0]["content"]),
             HumanMessage(content=messages_raw[1]["content"]),
@@ -323,7 +316,10 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
             }
 
         # ── Scrub hallucinations + inject ministry filter ──
-        final_sql = _inject_ministry_filter(raw_sql, entities, query_spec)
+        final_sql = _inject_ministry_filter(raw_sql, entities)
+        query_spec = state.get("query_spec") or {}
+        if query_spec.get("subject") == "payment":
+            final_sql = enforce_entity_filter(final_sql, query_spec)
 
         # ── Domain guard validation ──
         is_safe, reason = domain_guard.check_sql(final_sql)

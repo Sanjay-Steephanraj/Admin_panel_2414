@@ -9,10 +9,12 @@ class NLSQLState(TypedDict, total=False):
     session_id:             Optional[str]
     retry_count:            Optional[int]
     trace_id:               Optional[str]
-    # Authoritative interpretation contract; never reconstruct relative dates downstream.
     query_spec:             Optional[dict]
     last_successful_query_spec: Optional[dict]
     query_outcome:          Optional[str]
+    displayed_count:        int
+    total_count:            int
+    pending_clarification:  Optional[dict]
 
     # SQL generation
     generated_sql:          Optional[str]
@@ -36,8 +38,6 @@ class NLSQLState(TypedDict, total=False):
 
     # Cache
     cache_hit:              bool
-    displayed_count:        int
-    total_count:            int
 
     # Error passthrough
     error:                  Optional[str]

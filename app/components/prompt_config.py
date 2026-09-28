@@ -38,30 +38,23 @@ QUERY RULES — follow strictly:
 2. Output ONLY the raw SQL query — no markdown, no backticks, no comments, no explanation
 3. Never use SELECT * — always list explicit columns with aliases
 4. Table aliases: c = sf_contacts | m = sf_ministries | o = sf_opportunities | p = sfpayments
-5. Joins — when a join is needed, always follow these relationship keys:
+5. Joins — always follow these relationship keys:
    - sf_contacts → sf_opportunities  :  c.sfid = o.primarycontact
    - sf_opportunities → sfpayments   :  o.sfid = p.oppsfid
    - sfpayments → sf_ministries      :  p.ministryid = m.sfid
-   Direct payment totals/counts may query sfpayments without joining
-   sf_opportunities; join sf_ministries only when a ministry name/code/id is
-   requested or ministry fields are selected.
 6. Use LEFT JOIN by default; use INNER JOIN only when a match is required
 7. List queries: add LIMIT 100
 8. Aggregate queries (totals, counts, averages): no LIMIT
 9. Donor full name: CONCAT(c.firstname, ' ', c.lastname) AS donor_name
 10. Boolean columns (paid, isActive, donotcall etc.): compare with 1 or 0
-11. Date filtering: use the exact supplied absolute start_date and exclusive_end_date boundaries. Never reinterpret relative periods or use month-only predicates when the specification supplies dates.
+11. Date filtering: use YEAR(), MONTH(), DATE(), or BETWEEN on date columns
 12. If the question cannot be answered with the available tables and columns,
     or is too vague to generate a reliable query, output exactly: UNCLEAR
-13. If the specification contains entity_id, use exactly one receiver predicate: m.sfid = '<entity_id>'.
+13. If entity_role is receiving_ministry and the specification contains entity_id,
+    use exactly one receiver predicate: m.sfid = '<entity_id>'.
     Do not add m.name, m.giftcode, p.ministryid, or any second ministry predicate in WHERE.
-    Otherwise, if the question mentions a ministry code or identifier (e.g. '532PHI', '095WMN',
-    '801BOB'), filter using UPPER(m.giftcode) = '<CODE_IN_UPPERCASE>'.
-    If the question mentions a ministry by name (e.g. 'petals of hope'), filter
-    using LOWER(m.name) LIKE '%<name_in_lowercase>%'.
-    If the question refers to "our organisation", "our ministry", "us", or "our",
-    ALWAYS filter using UPPER(m.giftcode) = '098WRLD'.
-    Never return UNCLEAR just because a ministry name or code appears in the question.
+    Ministry names/codes must already be resolved to entity_id before SQL generation;
+    do not reconstruct a ministry filter from raw question text.
 14. When filtering by a donor's name, follow these EXACT rules based on the input:
 
     CASE A — Full name given (e.g. 'Daniel Karunakaran', 'Martin Gauss', 'Donald Gordon'):
@@ -126,6 +119,15 @@ QUERY RULES — follow strictly:
   19. Donor churn / attrition / "at risk" / lapsed-donor questions are handled by a
       dedicated analytical module outside this query engine. If asked to identify
       donors at risk of churning, lapsing, or becoming inactive, output exactly: UNCLEAR
+20. Follow the structured result_shape and metric. Total: SUM(p.paymentamount) AS total_amount.
+    Count: COUNT(*) AS record_count. Average: AVG(p.paymentamount) AS average_amount.
+    Scalars have no GROUP BY or LIMIT. Ministry reports select m.name AS ministry_name,
+    group by m.sfid, m.name, and use the requested aggregate alias.
+    Payment details return at least p.paymentamount and p.paymentdate.
+    Do not add donor, ministry, status, or date filters not present in the specification.
+    A paid status is p.paid = 1; unpaid is p.paid = 0. Do not infer paid from the
+    verb 'paid' or 'received' alone. No requested status means no paid predicate.
+    Use one direct SELECT with the documented joins for these payment reports.
   """
 
 INTENT_SUMMARY_INSTRUCTIONS: dict[str, str] = {

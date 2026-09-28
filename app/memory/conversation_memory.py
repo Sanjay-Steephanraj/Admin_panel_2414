@@ -1,11 +1,11 @@
 """
 memory/conversation_memory.py
 ──────────────────────────────
-Native LangGraph conversation memory (used when REDIS_ENABLED=false).
+Native LangGraph conversation memory.
 
 Session history lives inside a MemorySaver checkpointer, keyed by
-session_id as the LangGraph thread_id. In-process only — history is
-lost on restart (acceptable: ~5 users).
+session_id as the LangGraph thread_id. MemorySaver is process-local; history
+is lost on restart and is not shared between multiple workers.
 
 Two guards keep this bounded (see BLOCKER A / B in the design notes):
 
@@ -24,7 +24,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 logger = logging.getLogger(__name__)
 
-MAX_TURNS = 5  # same sliding window as the Redis session_store
+MAX_TURNS = 5
 SESSION_TTL_SECONDS = 7200  # matches the old Redis session TTL
 
 checkpointer = MemorySaver()
@@ -61,6 +61,17 @@ def load_history(graph, session_id: str) -> list[dict]:
         logger.warning(f"Memory load error: {e}")
     return []
 
+def load_pending(graph, session_id: str) -> dict | None:
+    snapshot = graph.get_state(thread_config(session_id))
+    return snapshot.values.get("pending_clarification") if snapshot and snapshot.values else None
+
+def save_pending(graph, session_id: str, pending: dict | None) -> None:
+    # Pending clarification is separate from successful-turn history.
+    graph.update_state(thread_config(session_id),
+                       {"pending_clarification": pending, "db_result": []}, as_node="record_turn")
+    _prune_to_latest(session_id)
+    touch(session_id)
+
 
 def clear_history(graph, session_id: str) -> None:
     """Reset a session's conversation history and free its checkpoint memory."""
@@ -83,9 +94,10 @@ def record_turn(state: dict) -> dict:
     """
     if (
         state.get("validation_passed")
-        and state.get("db_result")
         and state.get("summary")
         and not state.get("error")
+        and not state.get("db_error")
+        and state.get("query_outcome") == "success"
     ):
         from datetime import datetime
         turn = {
@@ -94,6 +106,9 @@ def record_turn(state: dict) -> dict:
             "summary":  state.get("summary"),
             "ts":       datetime.utcnow().isoformat(),
             "query_spec": state.get("query_spec"),
+            "displayed_count": state.get("displayed_count", len(state.get("db_result") or [])),
+            "total_count": state.get("total_count", len(state.get("db_result") or [])),
+            "query_outcome": "success",
         }
         history = (state.get("session_history") or []) + [turn]
         return {"session_history": history[-MAX_TURNS:]}

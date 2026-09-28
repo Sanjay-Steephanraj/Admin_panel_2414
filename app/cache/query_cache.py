@@ -37,6 +37,9 @@ class CacheEntry:
     summary:    str
     row_count:  int
     created_at: float = field(default_factory=time.time)
+    displayed_count: int = 0
+    total_count: int = 0
+    query_spec: dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────
@@ -147,7 +150,13 @@ class RedisQueryCache:
                 logger.info(f"Redis HIT (exact hash) | q={question!r}")
                 return CacheEntry(**data)
 
-            # ── Similarity match against index ───────────────────────────────
+            # Contract keys encode all resolved filters. Approximate matching
+            # would allow another entity/metric/status to return the wrong answer.
+            if question.startswith("contract-v2:"):
+                self._misses += 1
+                return None
+
+            # ── Similarity match against index (legacy callers only) ─────────
             all_norms = r.smembers(self.index_key)
             if not all_norms:
                 self._misses += 1
@@ -194,7 +203,9 @@ class RedisQueryCache:
             return None
 
     # ── WRITE ────────────────────────────────────────────────────────────────
-    def set(self, question: str, sql: str, summary: str, row_count: int) -> bool:
+    def set(self, question: str, sql: str, summary: str, row_count: int,
+            displayed_count: int | None = None, total_count: int | None = None,
+            query_spec: dict | None = None) -> bool:
         """
         Stores a cache entry. Returns True if written, False if skipped
         (Redis unavailable) or if an error occurred.
@@ -215,7 +226,10 @@ class RedisQueryCache:
                     r.delete(self._entry_key(oldest))
                     r.srem(self.index_key, oldest)
 
-            entry = CacheEntry(sql=sql, summary=summary, row_count=row_count)
+            entry = CacheEntry(sql=sql, summary=summary, row_count=row_count,
+                               displayed_count=row_count if displayed_count is None else displayed_count,
+                               total_count=row_count if total_count is None else total_count,
+                               query_spec=query_spec or {})
 
             # SETEX enforces TTL on every entry — no stale entries possible
             r.setex(

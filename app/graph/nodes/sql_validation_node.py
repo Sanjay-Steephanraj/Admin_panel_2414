@@ -13,13 +13,13 @@ from data_masking import masker
 from llm.gloo_client import get_llm
 from llm.prompts import build_sql_validation_prompt
 from tools.db_tool import execute_query
-from components.query_spec import semantic_sql_errors
+from components.sql_contract import semantic_sql_errors, unlimited_count_sql
 
 logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# REMOVE DATE FILTER (FALLBACK SUPPORT)
+# Legacy date-widening helpers are retained only as inert compatibility shims.
 # =========================================================
 
 # Comparison operators recognised in YEAR/MONTH/DAY(col) <op> <expr> shapes.
@@ -208,73 +208,16 @@ def _strip_date_conditions(region: str) -> str:
 
 
 def remove_date_filter(sql: str) -> str:
-    """
-    Strips temporal filter conditions so the fallback query returns all-time
-    data, while ALWAYS leaving syntactically valid SQL.
-
-    Handles four condition shapes, in both leading-AND and sole-WHERE
-    positions:
-      - (YEAR|MONTH|DAY)(col) <op> <expr>   (op in =,!=,<>,>=,<=,>,<)
-      - col BETWEEN 'date' AND 'date'
-      - DATE(col) <op> 'date'
-      - bare <datecol> <op> <expr>  (paymentdate / payment_date)
-
-    Connector fix-up rules:
-      - leading AND/OR removed with the condition
-      - first-after-WHERE condition: trailing AND/OR removed instead
-      - if only condition → `WHERE 1=1`
-    Never leaves WHERE AND, WHERE OR, a dangling trailing connector, or a
-    WHERE with no condition. Idempotent. Returns input unchanged if nothing
-    matched.
-    """
-    # Retained as a compatibility shim only. Date widening is forbidden by the
-    # query contract and this function must never change executable SQL.
+    """Compatibility shim. Automatic date widening is disabled (AA-04)."""
     return sql
-
-    region = _find_outer_where_region(sql)
-    if region is None:
-        return sql
-
-    start, end = region
-    head = sql[:start]
-    where_region = sql[start:end]
-    tail = sql[end:]
-
-    new_region = _strip_date_conditions(where_region)
-
-    if new_region == where_region:
-        return sql  # nothing matched → byte-identical (callers rely on this)
-
-    result = head + new_region + tail
-    # Collapse accidental double spaces from surgery. Do NOT rstrip when a
-    # trailing clause (GROUP BY/ORDER BY/...) follows — the region ended at
-    # the clause keyword's first char, so new_region's trailing space is the
-    # only separator between WHERE body and that clause.
-    result = re.sub(r" {2,}", " ", result)
-    if not tail:
-        result = result.rstrip()
-    return result
 
 
 def _has_date_filter(sql: str) -> bool:
     """
-    True if SQL contains a temporal filter that remove_date_filter would
-    strip. Detection mirrors _is_date_condition's shapes so the fallback is
-    attempted exactly when stripping is possible.
+    Historical helper retained for compatibility; it is never used by the
+    validator because automatic date widening is prohibited.
     """
-    region = _find_outer_where_region(sql)
-    if region is None:
-        return False
-    start, end = region
-    where_region = sql[start:end]
-
-    where_kw_match = re.match(r"\s*WHERE\b", where_region, re.IGNORECASE)
-    if not where_kw_match:
-        return False
-    body = where_region[where_kw_match.end():]
-
-    pieces = _split_conditions(body)
-    return any(_is_date_condition(cond) for _, cond in pieces)
+    return False
 
 
 # =========================================================
@@ -283,11 +226,8 @@ def _has_date_filter(sql: str) -> bool:
 
 def sql_validation_node(state: NLSQLState) -> NLSQLState:
     """
-    Step 1 : Execute original SQL
-    Step 2a: Rows found          → return success
-    Step 2b: No rows + date filt → fallback (strip date filter)
-    Step 2c: No rows at all      → return empty
-    Step 3 : DB error            → LLM validation for fix
+    Check meaning before execution. Return rows or a valid zero result with
+    the same filters. Semantic/DB errors enter the existing repair loop.
     """
 
     sql      = state.get("generated_sql")
@@ -304,13 +244,12 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             "db_error":          "No SQL to validate",
         }
 
-    # ── Semantic contract validation happens before database execution. ──
-    semantic_errors = semantic_sql_errors(sql, query_spec)
-    if semantic_errors:
-        feedback = "SEMANTIC SQL MISMATCH:\n" + "\n".join(f"- {e}" for e in semantic_errors)
-        logger.warning("[sql_validation] %s", feedback)
-        return {**state, "validation_passed": False, "fallback_used": False,
-                "db_error": None, "message": None, "llm_validation_feedback": feedback}
+    contract_errors = semantic_sql_errors(sql, query_spec)
+    if contract_errors:
+        return {**state, "validation_passed": False, "db_error": None,
+                "message": None, "displayed_count": 0, "total_count": 0,
+                "query_outcome": "retrieval_error",
+                "llm_validation_feedback": "SEMANTIC SQL MISMATCH:\n" + "\n".join(f"- {e}" for e in contract_errors)}
 
     # ── STEP 1: Execute original query ───────────────────
     logger.info(f"[sql_validation] Executing SQL:\n{sql}")
@@ -323,14 +262,14 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
         if db_result:
             displayed_count = len(db_result)
             total_count = displayed_count
-            limit_match = re.search(r"\blimit\s+(\d+)\s*;?\s*$", sql, re.IGNORECASE)
-            if limit_match and displayed_count >= int(limit_match.group(1)):
-                base_sql = re.sub(r"\s+limit\s+\d+\s*;?\s*$", "", sql, flags=re.IGNORECASE).strip().rstrip(";")
-                count_rows, count_error = execute_query(
-                    f"SELECT COUNT(*) AS total_count FROM ({base_sql}) AS _counted"
-                )
-                if not count_error and count_rows:
-                    total_count = int(count_rows[0].get("total_count") or displayed_count)
+            count_sql = (unlimited_count_sql(sql)
+                         if query_spec.get("result_shape") in {"detail", "grouped"}
+                         else None)
+            if count_sql:
+                count_rows, count_error = execute_query(count_sql)
+                if count_error or not count_rows or "total_count" not in count_rows[0]:
+                    return {**state, "db_result": [], "validation_passed": False, "db_error": count_error or "Could not verify total record count", "fallback_used": False, "query_outcome": "retrieval_error", "displayed_count": 0, "total_count": 0, "llm_validation_feedback": "Could not verify total record count with the same filters"}
+                total_count = int(count_rows[0]["total_count"])
             logger.info(f"[sql_validation] Success | rows={len(db_result)}")
             return {
                 **state,
@@ -339,13 +278,14 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
                 "validation_passed":      True,
                 "fallback_used":          False,       # ← explicit
                 "message":                None,
+                "displayed_count":        displayed_count,
+                "total_count":             total_count,
+                "query_outcome":          "success",
                 "llm_validation_feedback": "DB execution successful — LLM validation skipped",
-                "displayed_count": displayed_count,
-                "total_count": total_count,
             }
 
-        # A valid zero-row query is final. Never remove requested filters.
-        logger.info("[sql_validation] No data found; preserving original query contract")
+        # A valid zero-row query is final; requested filters are never widened.
+        logger.info("[sql_validation] No data found")
         return {
             **state,
             "db_result":              [],
@@ -353,9 +293,9 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             "validation_passed":      True,
             "fallback_used":          False,           # ← explicit
             "message":                "No contributions found for the given query.",
-            "query_outcome":          "no_results",
             "displayed_count":        0,
             "total_count":             0,
+            "query_outcome":          "no_results",
             "llm_validation_feedback": "Query valid but returned no data",
         }
 
@@ -378,7 +318,6 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             generated_sql=masked_sql,
             db_error=masked_err,
             db_result_sample=db_result_sample,
-            query_spec=query_spec,
         )
 
         messages = [

@@ -1,13 +1,13 @@
-import os
 import asyncio
 import logging
+import os
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
 import re
 from datetime import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -15,7 +15,7 @@ from graph.pipeline import run_nlsql_pipeline
 from config.settings import get_settings
 from security.domain_guard import domain_guard
 from llm.prompts import is_ambiguous, user_error_message
-from components.query_normalizer import normalize_question, detect_name_ambiguity
+from components.query_normalizer import normalize_question, detect_name_ambiguity, _regex_extract
 from components.query_spec import build_query_spec, merge_follow_up, resolve_ministry
 from llm.question_expander import is_genuine_follow_up
 from tools.db_tool import ping_db
@@ -47,19 +47,7 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("Redis: unavailable")
     else:
-        logger.info("Redis: disabled — using LangGraph in-memory conversation memory")
-        # BLOCKER B: MemorySaver is per-process; multiple workers/replicas
-        # break sessions randomly. Fail fast instead of corrupting state.
-        workers = int(os.getenv("WEB_CONCURRENCY", "1") or "1")
-        if workers > 1:
-            raise RuntimeError(
-                "REDIS_ENABLED=false uses in-process conversation memory and "
-                "requires a single worker/replica. Set WEB_CONCURRENCY=1 or enable Redis."
-            )
-        logger.warning(
-            "In-memory conversation mode: run exactly ONE worker and ONE replica "
-            "(sessions are per-process and lost on restart)."
-        )
+        logger.info("Redis: disabled — using LangGraph MemorySaver conversation memory")
 
     schema_resolver.initialize()
     logger.info(f"Schema: {schema_resolver.get_schema_status()}")
@@ -73,19 +61,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"PII masker warm-up failed: {e}")
 
-    # BLOCKER A2: idle-session eviction loop (in-memory mode only).
-    # MemorySaver keeps all threads forever; this drops ones idle longer
-    # than the session TTL, bounding memory for long-lived processes.
-    eviction_task = None
-    if not get_settings().redis_enabled:
-        async def _evict_loop():
-            from memory.conversation_memory import evict_idle_threads
-            while True:
-                await asyncio.sleep(600)  # every 10 min
-                n = await _run_sync(evict_idle_threads)
-                if n:
-                    logger.info(f"Evicted {n} idle session(s) from conversation memory")
-        eviction_task = asyncio.create_task(_evict_loop())
+    # MemorySaver is the conversation backend in every mode, so keep it
+    # bounded even when Redis is enabled for query caching.
+    async def _evict_loop():
+        from memory.conversation_memory import evict_idle_threads
+        while True:
+            await asyncio.sleep(600)  # every 10 min
+            n = await _run_sync(evict_idle_threads)
+            if n:
+                logger.info(f"Evicted {n} idle session(s) from conversation memory")
+    eviction_task = asyncio.create_task(_evict_loop())
 
     yield
     if eviction_task is not None:
@@ -179,35 +164,98 @@ async def _run_sync(fn, *args, **kwargs):
         fn = partial(fn, **kwargs)
     return await loop.run_in_executor(None, fn, *args)
 
+async def _load_pending(session_id: str):
+    if get_settings().redis_enabled:
+        return await _run_sync(session_store.load_pending, session_id)
+    from graph.pipeline import nlsql_graph
+    from memory.conversation_memory import load_pending
+    return await _run_sync(load_pending, nlsql_graph, session_id)
+
+async def _save_pending(session_id: str, pending: dict | None):
+    if get_settings().redis_enabled:
+        await _run_sync(session_store.save_pending, session_id, pending)
+        return
+    from graph.pipeline import nlsql_graph
+    from memory.conversation_memory import save_pending
+    await _run_sync(save_pending, nlsql_graph, session_id, pending)
+
 
 #  API endpoints 
 
 @app.post("/chat/query", response_model=AskResponse)
-@app.post("/api/chat/query", response_model=AskResponse, include_in_schema=False)
-async def ask(request: AskRequest):
+async def ask(request: AskRequest, http_request: Request, http_response: Response):
     request_id = str(uuid.uuid4())
     logger.info(f"[{request_id}] {request.question}")
 
     # ── Resolve Session ID ──
     SESSION_ID_RE = re.compile(r'^[a-zA-Z0-9\-]{8,64}$')
+    cookie_session_id = http_request.cookies.get("donor_session_id")
+    requested_session_id = request.session_id or cookie_session_id
     session_id = (
-        request.session_id
-        if request.session_id and SESSION_ID_RE.match(request.session_id)
+        requested_session_id
+        if requested_session_id and SESSION_ID_RE.match(requested_session_id)
         else str(uuid.uuid4())
     )
+    http_response.set_cookie(
+        key="donor_session_id",
+        value=session_id,
+        max_age=7200,
+        httponly=True,
+        samesite="lax",
+    )
 
-    # ── Load History ──
-    if get_settings().redis_enabled:
-        history = await _run_sync(session_store.load, session_id)
-    else:
-        from graph.pipeline import nlsql_graph
-        from memory.conversation_memory import load_history
-        history = await _run_sync(load_history, nlsql_graph, session_id)
+    from graph.pipeline import nlsql_graph
+    from memory.conversation_memory import load_history
+    history = await _run_sync(load_history, nlsql_graph, session_id)
+
+    pending = await _load_pending(session_id)
+    logger.info(
+        "[%s] session=%s source=%s history_turns=%d pending=%s",
+        request_id, session_id,
+        "body" if request.session_id else ("cookie" if cookie_session_id else "generated"),
+        len(history), bool(pending),
+    )
 
     # ── Expand Question (resolve follow-ups) ──
-    # expand_question now skips the LLM call when no follow-up signals
-    # are detected in the question, saving 300–500ms for standalone questions.
-    expanded_question = await _run_sync(expand_question, request.question, history)
+    # Pending clarification replies are exact values, not natural-language
+    # follow-ups. Do not send a bare year/month through the LLM expander.
+    expanded_question = (
+        request.question if pending
+        else await _run_sync(expand_question, request.question, history)
+    )
+    pending_year_answer = bool(
+        pending and pending.get("kind") == "year"
+        and re.fullmatch(r"\s*\d{4}\s*[.!]?\s*", request.question)
+    )
+    pending_ministry_answer = bool(
+        pending and pending.get("kind") == "ministry"
+        and re.fullmatch(r"\s*[A-Za-z0-9_-]+\s*", request.question)
+    )
+
+    # Resolve a pending clarification before classifying the short answer as
+    # a new question. A bare year such as "2023" is meaningful only here.
+    if pending_year_answer:
+        month = pending["query_spec"].get("period_label", "")
+        year = re.search(r"\d{4}", request.question).group(0)
+        expanded_question = re.sub(
+            r"\b" + re.escape(month) + r"\b",
+            month + " " + year,
+            pending["question"],
+            count=1,
+            flags=re.I,
+        )
+    elif pending_ministry_answer:
+        code = _regex_extract(request.question).get("ministry_code")
+        if code:
+            expanded_question = pending["question"] + f" ({code})"
+
+    follow_up = is_genuine_follow_up(expanded_question)
+    previous = next((t.get("query_spec") for t in reversed(history)
+                     if t.get("query_spec") and t.get("query_outcome", "success") == "success"), None)
+    if follow_up and not previous and not (pending_year_answer or pending_ministry_answer):
+        return AskResponse(response="Which ministry or donor and which report should I use?",
+                           question=request.question, row_count=0, cache_hit=False,
+                           request_id=request_id, session_id=session_id)
 
     # ── Ambiguity check (run on EXPANDED question) ──
     ambiguity_data = detect_name_ambiguity(expanded_question)
@@ -221,7 +269,7 @@ async def ask(request: AskRequest):
             session_id=session_id,
         )
 
-    if is_ambiguous(expanded_question):
+    if is_ambiguous(expanded_question) and not follow_up and not (pending_year_answer or pending_ministry_answer):
         return AskResponse(
             response=await _run_sync(generate_dynamic_error_reply, request.question, "ambiguous"),
             question=request.question,
@@ -233,7 +281,10 @@ async def ask(request: AskRequest):
 
     # ── Security check ──
     is_safe, reason, intent = await _run_sync(
-        domain_guard.check_question, expanded_question
+        domain_guard.check_question, expanded_question,
+        contextual_intent=("payment"
+                           if follow_up and previous.get("subject") == "payment"
+                           else None),
     )
     if not is_safe:
         error_type = "injection" if "injection" in reason.lower() else "off_topic"
@@ -246,25 +297,36 @@ async def ask(request: AskRequest):
             session_id=session_id,
         )
 
-    # ── Normalisation + authoritative query specification ──
+    # ── Normalisation + entity extraction ──
     norm_output = await _run_sync(normalize_question, expanded_question)
     normalized_question = norm_output["normalized_question"]
     entities            = norm_output["entities"]
-    query_spec = build_query_spec(normalized_question, entities)
-    if is_genuine_follow_up(request.question):
-        previous = next((t.get("query_spec") for t in reversed(history) if t.get("query_spec")), None)
+    query_spec = build_query_spec(expanded_question, entities)
+    if follow_up:
         query_spec = merge_follow_up(query_spec, previous)
-    if query_spec.get("period_ambiguity"):
-        return AskResponse(response="Which year should I use for that month?", question=request.question,
-                           row_count=0, cache_hit=False, request_id=request_id, session_id=session_id)
-    query_spec, resolution_clarification = await _run_sync(resolve_ministry, query_spec)
-    if resolution_clarification:
-        return AskResponse(response=resolution_clarification, question=request.question, row_count=0,
+    clarification_text = query_spec.get("period_ambiguity") or query_spec.get("clarification")
+    if clarification_text:
+        if query_spec.get("period_name") == "month" and not query_spec.get("start_date"):
+            await _save_pending(
+                session_id,
+                {
+                    "kind": "year",
+                    "question": expanded_question,
+                    "query_spec": query_spec,
+                },
+            )
+        return AskResponse(response=clarification_text, question=request.question, row_count=0,
                            cache_hit=False, request_id=request_id, session_id=session_id)
-    if query_spec.get("resolution_outcome") == "no_match":
-        name = query_spec.get("entity_name") or query_spec.get("entity_code") or "that ministry"
-        return AskResponse(response=f'No ministry record matches "{name}".', question=request.question, row_count=0,
+    query_spec, clarification = await _run_sync(resolve_ministry, query_spec)
+    if clarification:
+        await _save_pending(session_id, {"kind": "ministry", "question": expanded_question,
+                                          "query_spec": query_spec})
+        return AskResponse(response=clarification, question=request.question, row_count=0,
                            cache_hit=False, request_id=request_id, session_id=session_id)
+    if query_spec.get("resolution_outcome") == "retrieval_error":
+        return AskResponse(response=user_error_message("db_failure"), question=request.question, row_count=0,
+                           cache_hit=False, request_id=request_id, session_id=session_id)
+    await _save_pending(session_id, None)
 
     logger.info(f"Normalized Question: {normalized_question}")
     logger.info(f"Entities: {entities}")
@@ -290,29 +352,21 @@ async def ask(request: AskRequest):
         # Best-effort: a memory error must not break the churn answer.
         churn_turn_sql = "CHURN_ANALYSIS"
         try:
-            if get_settings().redis_enabled:
-                turn = {
-                    "question": normalized_question,
-                    "sql":      churn_turn_sql,
-                    "summary":  churn_result["summary"],
-                    "ts":       datetime.utcnow().isoformat(),
-                    "churn_offset": churn_result.get("offset", 0),
-                    "churn_shown":  churn_result.get("shown", 0),
-                    "churn_entities": churn_entities,
-                }
-                await _run_sync(session_store.append, session_id, turn)
-            else:
-                from graph.pipeline import nlsql_graph
-                from memory.conversation_memory import append_turn
-                await _run_sync(
-                    append_turn, nlsql_graph, session_id,
-                    normalized_question, churn_turn_sql, churn_result["summary"],
-                    extra={
-                        "churn_offset": churn_result.get("offset", 0),
-                        "churn_shown":  churn_result.get("shown", 0),
-                        "churn_entities": churn_entities,
-                    },
-                )
+            turn = {
+                "question": normalized_question,
+                "sql": churn_turn_sql,
+                "summary": churn_result["summary"],
+                "ts": datetime.utcnow().isoformat(),
+                "churn_offset": churn_result.get("offset", 0),
+                "churn_shown": churn_result.get("shown", 0),
+                "churn_entities": churn_entities,
+            }
+            from graph.pipeline import nlsql_graph
+            from memory.conversation_memory import append_turn
+            await _run_sync(
+                append_turn, nlsql_graph, session_id,
+                normalized_question, churn_turn_sql, churn_result["summary"], extra=turn,
+            )
         except Exception:
             logger.warning(f"[{request_id}] Churn turn recording failed", exc_info=True)
 
@@ -326,12 +380,11 @@ async def ask(request: AskRequest):
         )
 
     # ── Pipeline execution ──
-    effective_intent = "payment" if query_spec.get("subject") == "payment" else intent
     try:
         state = await _run_sync(
             run_nlsql_pipeline,
             normalized_question,
-            effective_intent,
+            "payment" if query_spec.get("subject") == "payment" else intent,
             entities,
             session_id=session_id,
             history=history,
@@ -370,41 +423,37 @@ async def ask(request: AskRequest):
         response = summary or await _run_sync(generate_dynamic_error_reply, request.question, "db_failure")
 
     # ── Save History (on success) ──
-    # When Redis is disabled, the record_turn graph node already persisted
-    # the turn via the MemorySaver checkpointer, so nothing to do here.
-    if get_settings().redis_enabled and state.get("validation_passed") and (state.get("db_result") or state.get("cache_hit")) and state.get("summary") and not state.get("error"):
+    if (state.get("validation_passed")
+            and state.get("summary") and not state.get("error")
+            and not state.get("db_error") and state.get("query_outcome") == "success"
+            and (state.get("db_result") or state.get("cache_hit"))):
         turn = {
             "question": normalized_question,
             "sql":      state.get("generated_sql"),
             "summary":  state.get("summary"),
             "ts":       datetime.utcnow().isoformat(),
-            "query_spec": state.get("query_spec"),
-            "displayed_count": state.get("displayed_count") or len(db_result),
-            "total_count": state.get("total_count") or len(db_result),
+            "query_spec": state.get("query_spec") or query_spec,
+            "displayed_count": state.get("displayed_count", len(db_result)),
+            "total_count": state.get("total_count", len(db_result)),
+            "query_outcome": "success",
         }
-        await _run_sync(session_store.append, session_id, turn)
+        from graph.pipeline import nlsql_graph
+        from memory.conversation_memory import append_turn
+        await _run_sync(
+            append_turn, nlsql_graph, session_id,
+            turn["question"], turn["sql"], turn["summary"], extra=turn,
+        )
 
     return AskResponse(
         response=response,
         question=request.question,
-        row_count=state.get("displayed_count") or len(db_result),
-        displayed_count=state.get("displayed_count") or len(db_result),
-        total_count=state.get("total_count") or len(db_result),
+        row_count=state.get("displayed_count", len(db_result)),
+        displayed_count=state.get("displayed_count", len(db_result)),
+        total_count=state.get("total_count", len(db_result)),
         cache_hit=cache_hit,
         request_id=request_id,
         session_id=session_id,
     )
-
-
-@app.get("/")
-async def root():
-    return {
-        "service": "Donor Portal AI",
-        "status": "ok",
-        "docs": "/docs",
-        "health": "/health",
-        "chat_endpoint": "POST /chat/query",
-    }
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -437,12 +486,9 @@ async def clear_cache():
 
 @app.delete("/api/session/{session_id}")
 async def clear_session(session_id: str):
-    if get_settings().redis_enabled:
-        await _run_sync(session_store.clear, session_id)
-    else:
-        from graph.pipeline import nlsql_graph
-        from memory.conversation_memory import clear_history
-        await _run_sync(clear_history, nlsql_graph, session_id)
+    from graph.pipeline import nlsql_graph
+    from memory.conversation_memory import clear_history
+    await _run_sync(clear_history, nlsql_graph, session_id)
     return {"message": "Session cleared"}
 
 
