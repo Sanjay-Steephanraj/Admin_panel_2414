@@ -180,6 +180,8 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
 def _result_fields(spec: dict) -> dict:
     if spec.get("group_by"): spec["metric"] = spec.get("metric") or "total"; spec["operation"], spec["result_shape"] = "grouped", "grouped"
     elif spec.get("metric"): spec["operation"], spec["result_shape"] = spec["metric"], "scalar"
+    elif spec.get("subject") == "payment" and spec.get("result_entity") == "donor": spec["operation"], spec["result_shape"] = "donor_list", "detail"
+    elif spec.get("subject") == "payment" and spec.get("result_entity") == "payment": spec["operation"], spec["result_shape"] = "details", "detail"
     elif spec.get("operation") == "donor_list": spec["result_shape"] = "detail"
     else: spec["operation"] = "details" if spec.get("subject") == "payment" else "list"; spec["result_shape"] = "detail"
     return spec
@@ -188,8 +190,10 @@ def merge_follow_up(current: dict, previous: dict | None) -> dict:
     """Called only for genuine follow-ups. Replace complete field bundles."""
     if not previous: return current
     merged = deepcopy(previous); explicit = set(current.get("explicit_fields", []))
-    for field in ("subject", "status", "metric", "group_by", "filters"):
+    for field in ("subject", "status", "metric", "group_by", "filters", "result_entity"):
         if field in explicit: merged[field] = deepcopy(current.get(field))
+    # Recalculate operation/result_shape from merged result_entity.
+    # Preserve old entity and period filters unless explicitly changed.
     for bundle, fields in (("entity", _ENTITY_FIELDS), ("period", _PERIOD_FIELDS)):
         if bundle in explicit:
             for field in fields: merged[field] = current.get(field)

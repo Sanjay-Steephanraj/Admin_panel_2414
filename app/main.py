@@ -319,6 +319,7 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
                            cache_hit=False, request_id=request_id, session_id=session_id)
     query_spec, clarification = await _run_sync(resolve_ministry, query_spec)
     if query_spec.get("resolution_outcome") == "no_match":
+        await _save_pending(session_id, None)
         name = query_spec.get("entity_code") or query_spec.get("entity_name") or "that ministry"
         return AskResponse(response=f"I could not find a ministry matching {name}. Please check its name or gift code.",
                            question=request.question, row_count=0, cache_hit=False,

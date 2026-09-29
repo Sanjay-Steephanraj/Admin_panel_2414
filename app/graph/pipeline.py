@@ -147,9 +147,8 @@ def run_nlsql_pipeline(
         session_id = str(uuid.uuid4())
         logger.warning("No session_id provided — using ephemeral thread %s", session_id)
     final_state = nlsql_graph.invoke(initial_state, config=thread_config(session_id))
-    if not redis_on:
-        from memory.conversation_memory import compact_thread
-        compact_thread(nlsql_graph, session_id)
+    from memory.conversation_memory import compact_thread
+    compact_thread(nlsql_graph, session_id)
 
     # ── Cache successful results ──────────────
     if redis_on and (

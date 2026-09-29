@@ -6,9 +6,10 @@ langgraph==1.2.4
 langgraph-checkpoint==4.1.1
 langgraph-prebuilt==1.1.0
 langgraph-sdk==0.4.2
-fastapi==0.111.0
+fastapi==0.141.1
+gradio==5.44.1
 uvicorn==0.49.0
-pydantic==2.13.4
+pydantic==2.11.10
 pydantic-settings==2.14.1
 mysql-connector-python==9.0.0
 redis==5.0.7
@@ -19,3 +20,5 @@ orjson==3.11.9
 typing-extensions==4.15.0
 presidio-analyzer==2.2.355
 spacy==3.7.5
+sqlglot==29.0.1
+tzdata==2025.2
