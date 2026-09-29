@@ -143,8 +143,6 @@ def _regex_extract(question: str) -> dict:
             prev      = candidate
             candidate = _LEADING_STOPWORDS.sub("", candidate).strip()
 
-        if re.search(r"\b(?:donate[ds]?|contribute[ds]?|paid|receive[ds]?)\b", question, re.I):
-            return {"ministry_name": None, "ministry_code": code, "confidence": "high"}
         candidate_lower = candidate.lower()
 
         if candidate_lower and candidate_lower not in _STOPWORD_NAMES:
@@ -152,6 +150,18 @@ def _regex_extract(question: str) -> dict:
             # High confidence only if the phrase is ≤ 3 words
             name_high = len(candidate.split()) <= 3
         # else name stays None — don't inject a bad filter
+
+    # Preserve official names written as "Ministry of <name>". This must run
+    # after suffix extraction so the complete receiver name reaches resolution.
+    of_match = _MINISTRY_OF_RE.search(question)
+    if of_match:
+        candidate = re.split(
+            r"\s+(?:receive[ds]?|donate[ds]?|contribute[ds]?|paid|in|for|from|to|during|over|this|last|all)\b",
+            of_match.group(1), maxsplit=1, flags=re.I,
+        )[0].strip(" ,.?'\")")
+        if candidate:
+            name = "Ministry of " + candidate
+            name_high = len(candidate.split()) <= 3
 
     # ── Confidence decision ──
     if code and not name:
@@ -209,7 +219,7 @@ def _llm_extract(question: str) -> dict:
             "Respond with ONLY valid JSON, no markdown, no explanation:\n"
             '{"ministry_name": "<name or null>", "ministry_code": "<code or null>"}\n\n'
             "Rules:\n"
-            "- ministry_name: the name WITHOUT the word 'ministry' or 'church', lowercase, or null\n"
+            "- ministry_name: preserve the complete official name, including 'ministry' or 'church', or null\n"
             "- ministry_code: the alphanumeric code only, uppercase, or null\n"
             "- If nothing is mentioned, return null for both fields\n"
             "- CRITICAL RULE: If the user is asking for 'contact details', 'profile', 'email', 'phone', or explicitly calls the entity a 'donor', the name belongs to a donor/contact, NOT a ministry. In this case, return null for ministry_name.\n"

@@ -2,9 +2,6 @@
 
 import re
 import logging
-from llm.gloo_client import get_llm
-from langchain_core.messages import SystemMessage, HumanMessage
-from data_masking import masker
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +19,7 @@ def is_genuine_follow_up(question: str) -> bool:
     if re.search(r"\b(?:donations?|payments?|contributions?)\s+(?:by|per)\s+ministr(?:y|ies)\b", q, re.I):
         return False
     if re.match(r"^(?:what|how) about\b", q, re.I):
-        return bool(re.search(r"\b(?:last|this|previous|today|yesterday|all time|count|total|average|paid|unpaid|details|ministr(?:y|ies)|donor|them|those|it)\b", q, re.I))
+        return bool(re.search(r"\b(?:last|this|previous|today|yesterday|all time|count|total|average|paid|unpaid|details|ministr(?:y|ies)|donor|them|those|it|january|february|march|april|may|june|july|august|september|october|november|december)\b", q, re.I))
     if re.fullmatch(r"(?:and|also|then|now)?\s*(?:a |the )?(?:count|total|average|how many|how much)(?: instead)?\s*\??", q, re.I):
         return True
     return bool(re.search(r"^(?:(?:and|also|then|now)\s+)?(?:for |in )?(?:last|this|previous)\s+(?:month|week|year)\s*\??$", q, re.I))
@@ -40,47 +37,7 @@ def expand_question(question: str, history: list[dict]) -> str:
         logger.info("Question is self-contained; skipping follow-up expansion")
         return question
 
-    # ── Mask PII in question + history before sending to LLM ──────────────
-    # Fail-closed: if masking raises, never send unmasked data — return original.
-    try:
-        mapping: dict = {}
-        masked_question, mapping = masker.mask_text(question, mapping)
-        masked_turns: list[str] = []
-        for i, t in enumerate(history):
-            m_turn, mapping = masker.mask_text(t["question"], mapping)
-            masked_turns.append(f"Turn {i+1}: Q: {m_turn}")
-        history_text = "\n".join(masked_turns)
-    except RuntimeError:
-        logger.warning("PII masking failed — skipping question expansion, returning original")
-        return question
-
-    # ── Expand only genuine follow-ups ──────────────
-    try:
-        system_prompt = (
-            "You rewrite follow-up questions to resolve pronouns and implicit references using prior conversation context.\n"
-            "CRITICAL RULES:\n"
-            "1. Retain ALL specific numbers, limits, names, and explicit filters from the original follow-up (e.g. '158', 'next 5', 'top 10').\n"
-            "2. If the user asks for 'some of the ministries from that 158', ensure '158 ministries' is explicitly in your output.\n"
-            "3. ONLY rewrite if the follow-up is clearly continuing the prior topic.\n"
-            "4. NEVER expand or rewrite fixed domain references like 'our ministry', 'our organisation', or 'us'. Leave them exactly as typed by the user, as the domain context handles them downstream.\n"
-            "5. If the follow-up is a completely new/unrelated topic, return it unchanged.\n"
-            "6. NEVER append organization names unless explicitly replacing a pronoun.\n\n"
-            "Respond ONLY with the rewritten question. No explanation."
-        )
-
-
-        user_prompt = f"Prior Conversation:\n{history_text}\n\nFollow-up: {masked_question}"
-
-        llm = get_llm()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ])
-        expanded = response.content.strip()
-        expanded = masker.unmask_text(expanded, mapping)
-        logger.info(f"Question expanded | orig={question!r} | expanded={expanded!r}")
-        return expanded
-
-    except Exception as e:
-        logger.error(f"Question expansion failed: {e}")
-        return question
+    # Structured inheritance in query_spec.merge_follow_up is authoritative.
+    # Preserve the user's continuation verbatim so an LLM rewrite cannot turn
+    # an elliptical continuation into a different standalone request.
+    return question

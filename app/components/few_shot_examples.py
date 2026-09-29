@@ -24,38 +24,39 @@ FEW_SHOT_EXAMPLES: list[dict] = [
     # =========================================================
     {
         "intent": "donor",
-        "question": "What is the contribution of John walker in the month of January and to which ministries he contributed",
+        "question": "What payments did John Walker make in January 2026 and to which ministries did he contribute?",
         "sql": """SELECT
-    CONCAT(c.firstname, ' ', c.lastname) AS donor_name,
-    m.name AS ministry_name,
-    SUM(p.paymentamount) AS total_contribution
+    CONCAT(COALESCE(c.firstname, ''), ' ', COALESCE(c.lastname, '')) AS donor_name,
+    p.paymentamount,
+    p.paymentdate,
+    m.name AS ministry_name
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
-WHERE p.paid = 1
-  AND LOWER(TRIM(c.firstname)) LIKE '%john%'
-  AND LOWER(TRIM(c.lastname)) LIKE '%walker%'
-  AND MONTH(p.paymentdate) = 1
-GROUP BY c.id, m.name
-ORDER BY total_contribution DESC"""
+WHERE LOWER(TRIM(c.firstname)) LIKE '%john%'
+  AND LOWER(TRIM(c.lastname)) = 'walker'
+  AND p.paymentdate >= '2026-01-01'
+  AND p.paymentdate < '2026-02-01'
+ORDER BY p.paymentdate DESC
+LIMIT 100"""
     },
 
     {
         "intent": "donor",
         "question": "Give us the list of donors who have donated to The Ministry of Grant Richison (097MGR)",
-        "sql": """SELECT
-    CONCAT(c.firstname, ' ', c.lastname) AS donor_name,
-    m.name AS ministry_name,
-    SUM(p.paymentamount) AS total_contribution
+        "sql": """SELECT DISTINCT
+    c.sfid AS donor_id,
+    CONCAT(COALESCE(c.firstname, ''), ' ', COALESCE(c.lastname, '')) AS donor_name,
+    c.email,
+    c.phone
 FROM sfpayments p
-LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
-LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '097MGR'
-GROUP BY c.id, m.name
-ORDER BY total_contribution DESC"""
+JOIN sf_ministries m ON p.ministryid = m.sfid
+JOIN sf_opportunities o ON p.oppsfid = o.sfid
+JOIN sf_contacts c ON o.primarycontact = c.sfid
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+ORDER BY donor_name
+LIMIT 100"""
     },
     
     # =========================================================
@@ -63,17 +64,18 @@ ORDER BY total_contribution DESC"""
     # =========================================================
     {
         "intent": "payment",
-        "question": "What were the contributions made to Ministry 801BOB in the month of January?",
+        "question": "What were the contributions made to Ministry 801BOB in January 2026?",
         "sql": """SELECT
-    m.name AS ministry_name,
-    SUM(p.paymentamount) AS total_contribution,
-    COUNT(p.id) AS total_donations
+    p.paymentamount,
+    p.paymentdate,
+    m.name AS ministry_name
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '801BOB'
-  AND MONTH(p.paymentdate) = 1
-GROUP BY m.name"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paymentdate >= '2026-01-01'
+  AND p.paymentdate < '2026-02-01'
+ORDER BY p.paymentdate DESC
+LIMIT 100"""
     },
 
     {
@@ -206,56 +208,45 @@ LIMIT 100"""
 
     {
         "intent": "payment",
-        "question": "Can you share the donations that were made in the month of January to 095WMN?",
+        "question": "Can you share the donations that were made in January 2026 to 095WMN?",
         "sql": """SELECT
     p.paymentamount,
     p.paymentdate,
     m.name AS ministry_name
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '095WMN'
-  AND MONTH(p.paymentdate) = 1
-ORDER BY p.paymentdate DESC"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paymentdate >= '2026-01-01'
+  AND p.paymentdate < '2026-02-01'
+ORDER BY p.paymentdate DESC
+LIMIT 100"""
     },
 
     {
         "intent": "payment",
         "question": "How many donations have been made to 095WMN?",
-        "sql": """SELECT
-    m.name AS ministry_name,
-    COUNT(p.id) AS total_donations
+        "sql": """SELECT COUNT(p.id) AS record_count
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '095WMN'
-GROUP BY m.name"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
     },
 
     {
         "intent": "payment",
         "question": "Can you give the total contributions to the ministry 801BOB?",
-        "sql": """SELECT
-    m.name AS ministry_name,
-    SUM(p.paymentamount) AS total_contribution
+        "sql": """SELECT SUM(p.paymentamount) AS total_amount
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '801BOB'
-GROUP BY m.name"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
     },
 
     {
         "intent": "payment",
         "question": "Can you give me the total donations of the ministry 470SFA?",
-        "sql": """SELECT
-    m.name AS ministry_name,
-    SUM(p.paymentamount) AS total_contribution
+        "sql": """SELECT SUM(p.paymentamount) AS total_amount
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '470SFA'
-GROUP BY m.name"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
     },
 
     # =========================================================
@@ -322,12 +313,10 @@ FROM sf_contacts"""
     {
         "intent": "aggregate",
         "question": "what is the highest donation for our organisation ?",
-        "sql": """SELECT
-    MAX(p.paymentamount) AS highest_donation
+        "sql": """SELECT MAX(p.paymentamount) AS highest_donation
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND UPPER(m.giftcode) = '098WRLD'"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
     }
 
 ]

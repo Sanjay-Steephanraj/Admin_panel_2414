@@ -47,7 +47,10 @@ QUERY RULES — follow strictly:
 8. Aggregate queries (totals, counts, averages): no LIMIT
 9. Donor full name: CONCAT(c.firstname, ' ', c.lastname) AS donor_name
 10. Boolean columns (paid, isActive, donotcall etc.): compare with 1 or 0
-11. Date filtering: use YEAR(), MONTH(), DATE(), or BETWEEN on date columns
+11. For payment periods, use the specification's exact boundaries:
+    p.paymentdate >= start_date AND p.paymentdate < exclusive_end_date.
+    Do not substitute YEAR(), MONTH(), DATE(), BETWEEN, or a year chosen from an example.
+    For all_time, add no paymentdate filter. Add paid/unpaid filters only when status requests them.
 12. If the question cannot be answered with the available tables and columns,
     or is too vague to generate a reliable query, output exactly: UNCLEAR
 13. If entity_role is receiving_ministry and the specification contains entity_id,
@@ -90,14 +93,15 @@ QUERY RULES — follow strictly:
     "payments BY <name>"  →  <name> is the DONOR (filter sf_contacts)
       Use Case A/B/C from rule 14 above (firstname/lastname columns).
 
-    "payments TO <name>"  →  <name> is the MINISTRY receiving the payment
-    "donations FOR <name>" →  <name> is the MINISTRY (filter sf_ministries.name)
-      Use: LOWER(m.name) LIKE '%<name_in_lowercase>%'
+    "payments TO <name>"  → resolved ministry ID filter (sf_ministries.sfid)
+      Use the already resolved m.sfid = '<entity_id>'; do not add a name/code predicate.
+    "donations FOR <name>" → resolved ministry ID filter (sf_ministries.sfid)
+      Use the already resolved m.sfid = '<entity_id>'; do not add a name/code predicate.
 
     "payments by Advancing Native Missions" → donor filter (sf_contacts.lastname)
-    "donations to Advancing Native Missions" → ministry filter (sf_ministries.name)
+    "donations to Advancing Native Missions" → resolved ministry ID filter (sf_ministries.sfid)
     "say about payments done by Fidelity Charitable" → donor filter (sf_contacts.lastname)
-    "contributions for Petals of Hope" → ministry filter (sf_ministries.name)
+    "contributions for Petals of Hope" → resolved ministry ID filter (sf_ministries.sfid)
 
     When no preposition is present and the name could be either, prefer checking
     BOTH: union sf_contacts name match AND sf_ministries name match, or ask for

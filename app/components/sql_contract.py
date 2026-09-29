@@ -286,7 +286,17 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
             errors.append("ministry report must return the ministry name")
     if spec.get("result_shape") == "scalar" and (group or tree.args.get("limit")):
         errors.append("scalar total/count/average must not have GROUP BY or LIMIT")
-    if spec.get("result_shape") == "detail":
+    if spec.get("operation") == "donor_list":
+        if not tree.args.get("distinct"):
+            errors.append("donor list must return DISTINCT donors, not one row per payment")
+        fields = set().union(*(_refs(p, tables) for p in tree.expressions))
+        if ("sf_contacts", "sfid") not in fields:
+            errors.append("donor list must include the unique sf_contacts.sfid identifier")
+        if not {("sf_contacts", "firstname"), ("sf_contacts", "lastname")}.issubset(fields):
+            errors.append("donor list must return the donor name")
+        if any(t != "sf_contacts" for t, c in fields if t):
+            errors.append("donor list projections must describe donors, not individual payments")
+    elif spec.get("result_shape") == "detail":
         if group or any(p.find(exp.AggFunc) for p in tree.expressions):
             errors.append("detail request was changed into an aggregate")
         fields = set().union(*(_refs(p, tables) for p in tree.expressions))

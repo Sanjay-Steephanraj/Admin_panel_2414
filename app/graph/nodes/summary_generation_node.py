@@ -24,6 +24,14 @@ def _no_results_message(spec: dict) -> str:
     status = " " + spec["status"] if spec.get("status") else ""
     filters = spec.get("filters") or {}
     extra = "; " + ", ".join(f"{key.replace('_', ' ')}: {value}" for key, value in filters.items()) if filters else ""
+    result_entity = spec.get("result_entity")
+    if spec.get("subject") != "payment":
+        label = {"donor": "donor", "ministry": "ministry"}.get(result_entity, "matching")
+        return f"No {label} records were found{entity}."
+    if result_entity == "donor":
+        return f"No donors were found{entity} during {period}{extra}."
+    if result_entity == "ministry":
+        return f"No ministries were found{entity} during {period}{extra}."
     return f"No recorded{status} payments were found{entity} during {period}{extra}."
 
 def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
@@ -33,6 +41,8 @@ def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
     headers = [k.replace("_", " ").title() for k in keys]
     spec = query_spec or {}
     title = (
+        "Donor details" if spec.get("result_entity") == "donor" else
+        "Ministry details" if spec.get("result_entity") == "ministry" else
         "Payment details"
         if spec.get("result_shape") == "detail"
         else "Payments by " + str(spec.get("group_by") or "group")

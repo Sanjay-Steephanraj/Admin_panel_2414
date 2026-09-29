@@ -318,6 +318,11 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
         return AskResponse(response=clarification_text, question=request.question, row_count=0,
                            cache_hit=False, request_id=request_id, session_id=session_id)
     query_spec, clarification = await _run_sync(resolve_ministry, query_spec)
+    if query_spec.get("resolution_outcome") == "no_match":
+        name = query_spec.get("entity_code") or query_spec.get("entity_name") or "that ministry"
+        return AskResponse(response=f"I could not find a ministry matching {name}. Please check its name or gift code.",
+                           question=request.question, row_count=0, cache_hit=False,
+                           request_id=request_id, session_id=session_id)
     if clarification:
         await _save_pending(session_id, {"kind": "ministry", "question": expanded_question,
                                           "query_spec": query_spec})
@@ -423,7 +428,7 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
         response = summary or await _run_sync(generate_dynamic_error_reply, request.question, "db_failure")
 
     # ── Save History (on success) ──
-    if (state.get("validation_passed")
+    if (cache_hit and state.get("validation_passed")
             and state.get("summary") and not state.get("error")
             and not state.get("db_error") and state.get("query_outcome") == "success"
             and (state.get("db_result") or state.get("cache_hit"))):

@@ -136,7 +136,12 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
     if details: explicit.append("detail")
     e = entities or {}; role, name, code = None, None, None
     if e.get("ministry_name") or e.get("ministry_code"): role, name, code = "receiving_ministry", e.get("ministry_name"), e.get("ministry_code")
-    if payment and re.search(r"\b(?:our (?:ministry|organisation|organization)|us)\b", lower): role, name, code = "receiving_ministry", None, "098WRLD"
+    our_receiver = re.search(
+        r"\bour (?:ministry|organisation|organization)\b|"
+        r"\b(?:to|for)\s+us\b|\b(?:we|us)\s+(?:received?|raise[ds]?)\b", lower,
+    )
+    if payment and not role and our_receiver:
+        role, name, code = "receiving_ministry", None, "098WRLD"
     donor = _donor_name(q)
     if donor: role, name, code = "donor", donor, None
     if role: explicit.append("entity")
@@ -146,11 +151,31 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
     if status: explicit.append("status")
     spec = {"subject": "payment" if payment else "other", **period, "status": status, "group_by": group_by, "entity_role": role, "entity_id": None, "entity_name": name, "entity_code": code, "metric": metric, "filters": {}, "explicit_fields": explicit}
     if re.search(r"\bfailed\s+(?:donations?|payments?)\b", lower): spec["clarification"] = "The payment records distinguish paid and unpaid payments. Which should I use?"
+    donor_rows = bool(re.search(r"\bdonors?\b", lower) and
+                      re.search(r"\b(?:list|show|get|give|which|who)\b", lower))
+    if payment:
+        spec["result_entity"] = "donor" if donor_rows and not metric and not group_by else "payment"
+    elif re.search(r"\b(?:donors?|contacts?|profile|email|phone)\b", lower):
+        spec["result_entity"] = "donor"
+    elif re.search(r"\bministr(?:y|ies)\b", lower):
+        spec["result_entity"] = "ministry"
+    else:
+        spec["result_entity"] = "record"
+    if donor_rows or re.search(r"\b(?:payment|donation|contribution) details?\b", lower):
+        explicit.append("result_entity")
+        if donor_rows:
+            spec["operation"], spec["result_shape"] = "donor_list", "detail"
+    else:
+        spec["operation"] = ("donor_list" if spec.get("subject") == "payment" and
+                              spec.get("result_entity") == "donor" else
+                              ("details" if spec.get("subject") == "payment" else "list"))
+        spec["result_shape"] = "detail"
     return _result_fields(spec)
 
 def _result_fields(spec: dict) -> dict:
     if spec.get("group_by"): spec["metric"] = spec.get("metric") or "total"; spec["operation"], spec["result_shape"] = "grouped", "grouped"
     elif spec.get("metric"): spec["operation"], spec["result_shape"] = spec["metric"], "scalar"
+    elif spec.get("operation") == "donor_list": spec["result_shape"] = "detail"
     else: spec["operation"] = "details" if spec.get("subject") == "payment" else "list"; spec["result_shape"] = "detail"
     return spec
 

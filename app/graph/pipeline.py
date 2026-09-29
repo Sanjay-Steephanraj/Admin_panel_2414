@@ -142,14 +142,12 @@ def run_nlsql_pipeline(
     }
 
     logger.info(f"Pipeline start | intent={intent} | question={question!r}")
-    if redis_on:
-        final_state = nlsql_graph.invoke(initial_state)
-    else:
-        from memory.conversation_memory import thread_config
-        if not session_id:
-            session_id = str(uuid.uuid4())
-            logger.warning("No session_id provided — using ephemeral thread %s", session_id)
-        final_state = nlsql_graph.invoke(initial_state, config=thread_config(session_id))
+    from memory.conversation_memory import thread_config
+    if not session_id:
+        session_id = str(uuid.uuid4())
+        logger.warning("No session_id provided — using ephemeral thread %s", session_id)
+    final_state = nlsql_graph.invoke(initial_state, config=thread_config(session_id))
+    if not redis_on:
         from memory.conversation_memory import compact_thread
         compact_thread(nlsql_graph, session_id)
 

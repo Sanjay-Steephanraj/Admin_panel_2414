@@ -318,6 +318,7 @@ def sql_validation_node(state: NLSQLState) -> NLSQLState:
             generated_sql=masked_sql,
             db_error=masked_err,
             db_result_sample=db_result_sample,
+            query_spec=state.get("query_spec") or {},
         )
 
         messages = [

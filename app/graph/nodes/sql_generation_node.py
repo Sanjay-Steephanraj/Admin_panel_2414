@@ -288,7 +288,10 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
         # History is NOT passed to SQL generation because the question has
         # already been expanded/contextualized in the prior node (~500-1000
         # tokens saved).
-        messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None)
+        messages_raw = build_sql_generation_prompt(
+            question, intent, retry_feedback, history=None,
+            query_spec=state.get("query_spec") or {},
+        )
         messages = [
             SystemMessage(content=messages_raw[0]["content"]),
             HumanMessage(content=messages_raw[1]["content"]),
@@ -315,11 +318,13 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
                 "error":                "Question too ambiguous to generate SQL",
             }
 
-        # ── Scrub hallucinations + inject ministry filter ──
-        final_sql = _inject_ministry_filter(raw_sql, entities)
         query_spec = state.get("query_spec") or {}
         if query_spec.get("subject") == "payment":
-            final_sql = enforce_entity_filter(final_sql, query_spec)
+            # The resolved structured specification is authoritative for all
+            # payment SQL. Do not inject raw ministry names/codes alongside it.
+            final_sql = enforce_entity_filter(raw_sql, query_spec)
+        else:
+            final_sql = _inject_ministry_filter(raw_sql, entities)
 
         # ── Domain guard validation ──
         is_safe, reason = domain_guard.check_sql(final_sql)
