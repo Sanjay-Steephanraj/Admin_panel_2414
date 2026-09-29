@@ -91,8 +91,7 @@ FROM sfpayments p
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND LOWER(TRIM(c.firstname)) LIKE '%daniel%'
+WHERE LOWER(TRIM(c.firstname)) LIKE '%daniel%'
   AND LOWER(TRIM(c.lastname)) = 'karunakaran'
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
@@ -111,8 +110,7 @@ FROM sfpayments p
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND (
+WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%national philanthropic trust%'
     OR LOWER(TRIM(c.lastname)) LIKE '%national philanthropic trust%'
   )
@@ -133,8 +131,7 @@ FROM sfpayments p
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND (
+WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%fidelity%'
     OR LOWER(TRIM(c.lastname)) LIKE '%fidelity%'
   )
@@ -155,8 +152,7 @@ FROM sfpayments p
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND (
+WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%boyd%'
     OR LOWER(TRIM(c.lastname)) LIKE '%boyd%'
   )
@@ -177,8 +173,7 @@ FROM sfpayments p
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE p.paid = 1
-  AND (
+WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%advancing native missions%'
     OR LOWER(TRIM(c.lastname)) LIKE '%advancing native missions%'
   )
@@ -199,8 +194,7 @@ FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
-WHERE p.paid = 1
-  AND LOWER(TRIM(m.name)) LIKE '%advancing native missions%'
+WHERE LOWER(TRIM(m.name)) LIKE '%advancing native missions%'
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },

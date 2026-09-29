@@ -112,6 +112,11 @@ def _period(question: str, today: date) -> tuple[str, str | None, str | None]:
     return period["period_name"], period["start_date"], period["exclusive_end_date"]
 
 def _donor_name(question: str) -> str | None:
+    # "donated/contributed/paid to ..." identifies the receiver, not the
+    # donor.  Do not let the broad legacy fallback below overwrite a ministry
+    # code/name extracted from the receiver clause (for example Q26).
+    if re.search(r"\b(?:donate[ds]?|contribute[ds]?|paid)\s+(?:to|for)\b", question, re.I):
+        return None
     patterns = (r"\b(?:donations?|payments?|contributions?|gifts?|transactions?)\s+(?:(?:made|done|given|received)\s+)?(?:by|from)\s+(.+)", r"\b(?:donated|contributed|paid)\s+by\s+(.+)", r"\b(?:did|has|have)\s+(.+?)\s+(?:donate[ds]?|contribute[ds]?|pay|paid)\b", r"^\s*(.+?)\s+(?:donated|contributed|paid)\b")
     for pattern in patterns:
         match = re.search(pattern, question, re.I)

@@ -494,6 +494,10 @@ async def clear_session(session_id: str):
     from graph.pipeline import nlsql_graph
     from memory.conversation_memory import clear_history
     await _run_sync(clear_history, nlsql_graph, session_id)
+    # Pending clarifications use SessionStore when Redis caching is enabled,
+    # while successful conversation history uses LangGraph MemorySaver. Clear
+    # both stores so a deleted session cannot resume stale clarification state.
+    await _run_sync(session_store.clear, session_id)
     return {"message": "Session cleared"}
 
 
