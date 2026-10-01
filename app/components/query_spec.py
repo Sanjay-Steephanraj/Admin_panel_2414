@@ -21,6 +21,7 @@ _ENTITY_STOP = re.compile(
 )
 _ENTITY_FIELDS = ("entity_role", "entity_id", "entity_name", "entity_code", "resolution_outcome")
 _PERIOD_FIELDS = ("period_name", "period_label", "start_date", "exclusive_end_date", "period_ambiguity")
+_GIVER_LIST_RE = re.compile(r"\b(?:list\s+(?:of\s+|all\s+)?|show\s+(?:me\s+|us\s+)?|"r"get\s+(?:the\s+)?|which\s+)givers?\b", re.I,)
 
 def reporting_date() -> date:
     from config.settings import get_settings
@@ -156,11 +157,10 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
     if status: explicit.append("status")
     spec = {"subject": "payment" if payment else "other", **period, "status": status, "group_by": group_by, "entity_role": role, "entity_id": None, "entity_name": name, "entity_code": code, "metric": metric, "filters": {}, "explicit_fields": explicit}
     if re.search(r"\bfailed\s+(?:donations?|payments?)\b", lower): spec["clarification"] = "The payment records distinguish paid and unpaid payments. Which should I use?"
-    donor_rows = bool(re.search(r"\bdonors?\b", lower) and
-                      re.search(r"\b(?:list|show|get|give|which|who)\b", lower))
+    donor_rows = bool((re.search(r"\bdonors?\b", lower) and re.search(r"\b(?:list|show|get|give|which|who)\b", lower)) or _GIVER_LIST_RE.search(lower))
     if payment:
         spec["result_entity"] = "donor" if donor_rows and not metric and not group_by else "payment"
-    elif re.search(r"\b(?:donors?|contacts?|profile|email|phone)\b", lower):
+    elif re.search(r"\b(?:donors?|contacts?|profile|email|phone)\b", lower) or _GIVER_LIST_RE.search(lower):
         spec["result_entity"] = "donor"
     elif re.search(r"\bministr(?:y|ies)\b", lower):
         spec["result_entity"] = "ministry"

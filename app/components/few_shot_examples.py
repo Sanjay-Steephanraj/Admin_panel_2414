@@ -43,7 +43,7 @@ LIMIT 100"""
     },
 
     {
-        "intent": "payment",
+        "intent": "donor",
         "question": "Give us the list of donors who have donated to The Ministry of Grant Richison (097MGR)",
         "sql": """SELECT DISTINCT
     c.sfid AS donor_id,
