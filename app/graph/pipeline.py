@@ -1,32 +1,23 @@
 import logging
 import uuid
-import hashlib
-import json
+
 from langgraph.graph import StateGraph, END
 
-from config.settings import get_settings
 from graph.states.nlsql_state import NLSQLState
 from .nodes.sql_generation_node import sql_generation_node
 from .nodes.sql_validation_node import sql_validation_node
 from .nodes.summary_generation_node import summary_generation_node
-from cache.query_cache import query_cache
 
 logger = logging.getLogger(__name__)
-
-def contract_cache_key(question: str, query_spec: dict | None) -> str:
-    payload = json.dumps({"question": " ".join(question.lower().split()),
-                          "query_spec": query_spec or {}}, sort_keys=True,
-                         separators=(",", ":"), ensure_ascii=False)
-    return "contract-v2:" + hashlib.sha256(payload.encode()).hexdigest()
 
 MAX_RETRIES = 2
 
 
 def route_after_validation(state: NLSQLState) -> str:
-    error             = state.get("error")
-    sql_error         = state.get("sql_generation_error")
+    error = state.get("error")
+    sql_error = state.get("sql_generation_error")
     validation_passed = state.get("validation_passed", False)
-    retry_count       = state.get("retry_count", 0)
+    retry_count = state.get("retry_count", 0)
 
     if error or sql_error == "UNCLEAR":
         return "summary"
@@ -45,16 +36,15 @@ def increment_retry(state: NLSQLState) -> NLSQLState:
 
 
 def build_nlsql_graph():
-    redis_on = get_settings().redis_enabled
     graph = StateGraph(NLSQLState)
 
-    graph.add_node("sql_generation",     sql_generation_node)
-    graph.add_node("sql_validation",     sql_validation_node)
+    graph.add_node("sql_generation", sql_generation_node)
+    graph.add_node("sql_validation", sql_validation_node)
     graph.add_node("summary_generation", summary_generation_node)
-    graph.add_node("increment_retry",    increment_retry)
+    graph.add_node("increment_retry", increment_retry)
 
     graph.set_entry_point("sql_generation")
-    graph.add_edge("sql_generation",  "sql_validation")
+    graph.add_edge("sql_generation", "sql_validation")
     graph.add_edge("increment_retry", "sql_generation")
 
     graph.add_conditional_edges(
@@ -63,8 +53,6 @@ def build_nlsql_graph():
         {"summary": "summary_generation", "retry": "increment_retry"},
     )
 
-    # Native LangGraph memory is the conversation backend in every mode.
-    # Redis is used only by the optional query cache above.
     from memory.conversation_memory import checkpointer, record_turn
     graph.add_node("record_turn", record_turn)
     graph.add_edge("summary_generation", "record_turn")
@@ -83,62 +71,28 @@ def run_nlsql_pipeline(
     history: list[dict] = None,
     query_spec: dict = None,
 ) -> NLSQLState:
-    redis_on = get_settings().redis_enabled
-    spec_key = contract_cache_key(question, query_spec)
-
-    # ── Cache check ───────────────────────────
-    if redis_on:
-        cached = query_cache.get(spec_key)
-        if cached:
-            logger.info(f" Cache hit: {question!r}")
-            return NLSQLState(
-                question=                question,
-                intent=                  intent,
-                entities=                entities or {},
-                session_id=              session_id,
-                session_history=         history or [],
-                generated_sql=           cached.sql,
-                sql_generation_error=    None,
-                db_result=               [],
-                db_error=                None,
-                fallback_used=           False,
-                message=                 None,
-                validation_passed=       True,
-                llm_validation_feedback= "Served from cache",
-                retry_count=             0,
-                summary=                 cached.summary,
-                cache_hit=               True,
-                error=                   None,
-                trace_id=                None,
-                query_spec=              cached.query_spec or query_spec or {},
-                displayed_count=         cached.displayed_count,
-                total_count=              cached.total_count,
-                query_outcome=           "success",
-            )
-
-    # ── Run graph ─────────────────────────────
     initial_state: NLSQLState = {
-        "question":                question,
-        "intent":                  intent,
-        "entities":                entities or {},
-        "session_id":              session_id,
-        "session_history":         history or [],
-        "generated_sql":           None,
-        "sql_generation_error":    None,
-        "db_result":               None,
-        "db_error":                None,
-        "fallback_used":           False,
-        "message":                 None,
-        "validation_passed":       None,
+        "question": question,
+        "intent": intent,
+        "entities": entities or {},
+        "session_id": session_id,
+        "session_history": history or [],
+        "generated_sql": None,
+        "sql_generation_error": None,
+        "db_result": None,
+        "db_error": None,
+        "fallback_used": False,
+        "message": None,
+        "validation_passed": None,
         "llm_validation_feedback": None,
-        "retry_count":             0,
-        "summary":                 None,
-        "cache_hit":               False,
-        "error":                   None,
-        "trace_id":                None,
-        "query_spec":              query_spec or {},
-        "displayed_count":         0,
-        "total_count":              0,
+        "retry_count": 0,
+        "summary": None,
+        "cache_hit": False,
+        "error": None,
+        "trace_id": None,
+        "query_spec": query_spec or {},
+        "displayed_count": 0,
+        "total_count": 0,
     }
 
     logger.info(f"Pipeline start | intent={intent} | question={question!r}")
@@ -149,28 +103,4 @@ def run_nlsql_pipeline(
     final_state = nlsql_graph.invoke(initial_state, config=thread_config(session_id))
     from memory.conversation_memory import compact_thread
     compact_thread(nlsql_graph, session_id)
-
-    # ── Cache successful results ──────────────
-    if redis_on and (
-        final_state.get("validation_passed")
-        and final_state.get("generated_sql")
-        and final_state.get("summary")
-        and not final_state.get("error")
-        and not final_state.get("db_error")
-        and final_state.get("query_outcome") == "success"
-    ):
-        stored = query_cache.set(
-            question=  spec_key,
-            sql=       final_state["generated_sql"],
-            summary=   final_state["summary"],
-            row_count= len(final_state.get("db_result") or []),
-            displayed_count=final_state.get("displayed_count", len(final_state.get("db_result") or [])),
-            total_count=final_state.get("total_count", len(final_state.get("db_result") or [])),
-            query_spec=final_state.get("query_spec") or query_spec or {},
-        )
-        if stored:
-            logger.info("Result stored in cache")
-        else:
-            logger.debug("Cache write skipped (Redis unavailable)")
-
     return final_state

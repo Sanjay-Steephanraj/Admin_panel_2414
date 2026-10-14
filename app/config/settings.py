@@ -21,14 +21,6 @@ class Settings(BaseSettings):
     mysql_database: str
 
 
-    # Redis Cache
-    redis_enabled:  bool = False
-    redis_host:     str = "localhost"
-    redis_port:     int = 6379
-    redis_db:       int = 0
-    redis_password: str = ""   
-    redis_key_prefix: str = ""   
-
     # Dynamic Schema
     use_dynamic_schema: bool = False
     dynamic_allowed_tables: str = ""   

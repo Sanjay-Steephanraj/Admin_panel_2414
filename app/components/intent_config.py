@@ -63,7 +63,8 @@ INTENTS: list[dict] = [
             "payment", "payments", "transaction", "transactions",
             "donation", "donations", "giving", "contribution",
             "paymentamount", "paymentdate", "donate", "donated",
-            "contribute", "contributed", "paid", "received"
+            "contribute", "contributed", "paid", "received",
+            "quickbooks", "qbo", "refund", "reversal", "chargeback"
         ],
         "tables": ["sfpayments"],
         "join_hint": "sfpayments.oppsfid = sf_opportunities.sfid",

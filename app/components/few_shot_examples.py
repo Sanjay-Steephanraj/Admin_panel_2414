@@ -36,6 +36,7 @@ LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 WHERE LOWER(TRIM(c.firstname)) LIKE '%john%'
   AND LOWER(TRIM(c.lastname)) = 'walker'
+  AND p.paid = 1
   AND p.paymentdate >= '2026-01-01'
   AND p.paymentdate < '2026-02-01'
 ORDER BY p.paymentdate DESC
@@ -55,6 +56,7 @@ JOIN sf_ministries m ON p.ministryid = m.sfid
 JOIN sf_opportunities o ON p.oppsfid = o.sfid
 JOIN sf_contacts c ON o.primarycontact = c.sfid
 WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1
 ORDER BY donor_name
 LIMIT 100"""
     },
@@ -72,6 +74,7 @@ LIMIT 100"""
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1
   AND p.paymentdate >= '2026-01-01'
   AND p.paymentdate < '2026-02-01'
 ORDER BY p.paymentdate DESC
@@ -93,6 +96,7 @@ LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 WHERE LOWER(TRIM(c.firstname)) LIKE '%daniel%'
   AND LOWER(TRIM(c.lastname)) = 'karunakaran'
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -114,6 +118,7 @@ WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%national philanthropic trust%'
     OR LOWER(TRIM(c.lastname)) LIKE '%national philanthropic trust%'
   )
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -135,6 +140,7 @@ WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%fidelity%'
     OR LOWER(TRIM(c.lastname)) LIKE '%fidelity%'
   )
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -156,6 +162,7 @@ WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%boyd%'
     OR LOWER(TRIM(c.lastname)) LIKE '%boyd%'
   )
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -177,6 +184,7 @@ WHERE (
     LOWER(TRIM(c.firstname)) LIKE '%advancing native missions%'
     OR LOWER(TRIM(c.lastname)) LIKE '%advancing native missions%'
   )
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -195,6 +203,7 @@ LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 LEFT JOIN sf_opportunities o ON p.oppsfid = o.sfid
 LEFT JOIN sf_contacts c ON o.primarycontact = c.sfid
 WHERE LOWER(TRIM(m.name)) LIKE '%advancing native missions%'
+  AND p.paid = 1
 ORDER BY p.paymentdate DESC
 LIMIT 100"""
     },
@@ -210,6 +219,7 @@ LIMIT 100"""
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
 WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1
   AND p.paymentdate >= '2026-01-01'
   AND p.paymentdate < '2026-02-01'
 ORDER BY p.paymentdate DESC
@@ -222,7 +232,8 @@ LIMIT 100"""
         "sql": """SELECT COUNT(p.id) AS record_count
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1"""
     },
 
     {
@@ -231,7 +242,8 @@ WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
         "sql": """SELECT SUM(p.paymentamount) AS total_amount
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1"""
     },
 
     {
@@ -240,7 +252,8 @@ WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
         "sql": """SELECT SUM(p.paymentamount) AS total_amount
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1"""
     },
 
     # =========================================================
@@ -310,7 +323,8 @@ FROM sf_contacts"""
         "sql": """SELECT MAX(p.paymentamount) AS highest_donation
 FROM sfpayments p
 LEFT JOIN sf_ministries m ON p.ministryid = m.sfid
-WHERE m.sfid = 'RESOLVED_MINISTRY_ID'"""
+WHERE m.sfid = 'RESOLVED_MINISTRY_ID'
+  AND p.paid = 1"""
     }
 
 ]
@@ -378,7 +392,7 @@ def format_few_shot_block(examples: list[dict]) -> str:
 # RUNTIME FEW-SHOT EXAMPLES (admin-confirmed feedback)
 # =========================================================
 # deliberate: in-process list, per-process and lost on restart, mirroring
-# the conversation-memory model used when Redis is disabled. No disk layer
+# the conversation-memory model. No disk layer
 # exists in this codebase, so persistence is intentionally out of scope.
 _RUNTIME_EXAMPLES: list[dict] = []
 _RUNTIME_LOCK = threading.Lock()
@@ -411,7 +425,7 @@ def add_example(question: str, sql: str, intent: str) -> bool:
     also draws from, so confirmed corrections influence subsequent SQL
     generation without a restart. Storage is intentionally in-memory: it is
     per-process and lost on restart, matching the conversation-memory model
-    used when Redis is disabled.
+    used by the application.
 
     Returns True when the example was stored, False when it was rejected
     (blank fields, non-SELECT SQL, unknown intent, or duplicate).

@@ -13,7 +13,7 @@ Two guards keep this bounded (see BLOCKER A / B in the design notes):
    channel from the checkpoint and drop all but the latest checkpoint,
    so a thread holds only its conversation history at rest.
 2. evict_idle_threads — background loop drops threads idle longer than
-   SESSION_TTL_SECONDS (mirrors the old Redis session TTL).
+   SESSION_TTL_SECONDS controls idle in-process session eviction.
 """
 import logging
 import threading
@@ -25,7 +25,7 @@ from langgraph.checkpoint.memory import MemorySaver
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = 5
-SESSION_TTL_SECONDS = 7200  # matches the old Redis session TTL
+SESSION_TTL_SECONDS = 7200
 
 checkpointer = MemorySaver()
 
@@ -242,7 +242,7 @@ def evict_idle_threads() -> int:
 
 
 def memory_stats() -> dict:
-    """Stats for the /health endpoint when Redis is disabled."""
+    """Stats for the /health endpoint."""
     with _lock:
         active = len(_last_access)
     return {

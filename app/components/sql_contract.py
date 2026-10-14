@@ -140,7 +140,7 @@ def _remove_identity(node, tables, role):
     return None if _identity_filter(node, tables, role) else node.copy()
 
 
-def enforce_entity_filter(sql: str, spec: dict) -> str:
+def _enforce_single_entity(sql: str, spec: dict) -> str:
     """Replace only the requested entity's filters; preserve dates and joins."""
     role = spec.get("entity_role")
     if role not in {"receiving_ministry", "donor"} or not (spec.get("entity_id") or spec.get("entity_name") or spec.get("entity_code")):
@@ -173,6 +173,13 @@ def enforce_entity_filter(sql: str, spec: dict) -> str:
             join.set("on", remaining if remaining is not None else exp.true())
     return tree.sql(dialect="mysql")
 
+def enforce_entity_filter(sql: str, spec: dict) -> str:
+    """Enforce every named role, never trade a receiver for a donor."""
+    from components.query_spec import entity_constraints
+    for constraint in entity_constraints(spec).values():
+        sql = _enforce_single_entity(sql, constraint)
+    return sql
+
 
 def unlimited_count_sql(sql: str) -> str | None:
     """Count the same result, retaining grouping/HAVING and removing pagination."""
@@ -186,8 +193,21 @@ def unlimited_count_sql(sql: str) -> str | None:
 
 
 def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
+    if spec.get("period_ambiguity") or spec.get("clarification") or spec.get("unresolved_condition"):
+        return ["resolve the report clarification before executing SQL"]
+    if spec.get("qualification"):
+        from components.report_rules import special_report_sql
+        try:
+            expected = special_report_sql(spec)
+            if expected is None or parse_one(sql, read="mysql") != parse_one(expected, read="mysql"):
+                return ["qualifying report SQL does not match its approved filters, grouping and result"]
+            return []
+        except (ValueError, TypeError, AttributeError):
+            return ["qualifying report SQL could not be verified"]
     if spec.get("subject") != "payment":
-        return []  # keep other existing Admin features on their existing path
+        if spec.get("result_entity") == "ministry" and not spec.get("entity_role"):
+            return _ministry_sql_errors(sql, spec)
+        return []  # other existing Admin features retain their existing path
     errors = []
     try:
         statements = parse(sql, read="mysql")
@@ -210,30 +230,32 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
     comparisons = [n for body in bodies for n in body.walk()
                    if isinstance(n, (exp.Predicate, exp.Binary)) and not isinstance(n, (exp.And, exp.Or))]
     required_comparisons = [_comparison(p, tables) for p in required]
-    role = spec.get("entity_role")
-    ministry_needed = role == "receiving_ministry" or spec.get("group_by") == "ministry" or "sf_ministries" in tables.values()
+    from components.query_spec import entity_constraints
+    roles = entity_constraints(spec)
+    receiver, donor = roles.get("receiving_ministry"), roles.get("donor")
+    ministry_needed = bool(receiver) or spec.get("result_entity") == "ministry" or spec.get("group_by") == "ministry" or "sf_ministries" in tables.values()
     if ministry_needed:
         if not _has_join(join_predicates, tables, ("sfpayments", "ministryid"), ("sf_ministries", "sfid")):
             errors.append("receiving ministry join must be p.ministryid = m.sfid")
     if "sf_opportunities" in tables.values():
         if not _has_join(join_predicates, tables, ("sfpayments", "oppsfid"), ("sf_opportunities", "sfid")):
             errors.append("opportunity join must be p.oppsfid = o.sfid")
-    if role == "donor" or "sf_contacts" in tables.values():
+    if donor or "sf_contacts" in tables.values():
         if not _has_join(join_predicates, tables, ("sf_opportunities", "primarycontact"), ("sf_contacts", "sfid")):
             errors.append("donor join must be o.primarycontact = c.sfid")
-    if role == "receiving_ministry" and (spec.get("entity_name") or spec.get("entity_code") or spec.get("entity_id")):
-        wanted = (("sf_ministries", "sfid"), exp.EQ, str(spec.get("entity_id") or "").lower())
-        if not spec.get("entity_id") or wanted not in required_comparisons:
+    if receiver and (receiver.get("entity_name") or receiver.get("entity_code") or receiver.get("entity_id")):
+        wanted = (("sf_ministries", "sfid"), exp.EQ, str(receiver.get("entity_id") or "").lower())
+        if not receiver.get("entity_id") or wanted not in required_comparisons:
             errors.append("canonical ministry constraint must be m.sfid = resolved entity_id in WHERE")
-        entity_conditions = [n for n in comparisons if _identity_filter(n, tables, role)]
+        entity_conditions = [n for n in comparisons if _identity_filter(n, tables, "receiving_ministry")]
         if len(entity_conditions) != 1 or any(_comparison(n, tables) != wanted for n in entity_conditions):
             errors.append("remove extra ministry name/code/ID filters; use only one official ministry ID predicate")
-    if role == "donor":
+    if donor:
         contact_aliases = [a for a, t in tables.items() if t == "sf_contacts"]
-        if len(contact_aliases) != 1 or not spec.get("entity_name") and not spec.get("entity_code"):
+        if len(contact_aliases) != 1 or not donor.get("entity_name") and not donor.get("entity_code"):
             errors.append("donor query requires an identified donor and sf_contacts")
         else:
-            expected = _donor_filter(spec, contact_aliases[0])
+            expected = _donor_filter(donor, contact_aliases[0])
             expected_parts = _conjuncts(expected)
             donor_conjuncts = _conjuncts(where.this if where else None)
             if not all(any(p == actual for actual in donor_conjuncts) for p in expected_parts):
@@ -241,9 +263,9 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
             allowed = {_comparison(n, tables) for n in expected.walk() if isinstance(n, (exp.EQ, exp.Like))}
             if any(_comparison(n, tables) not in allowed for n in comparisons if _identity_filter(n, tables, "donor")):
                 errors.append("SQL contains a conflicting donor filter")
-    if role != "donor" and any(_identity_filter(n, tables, "donor") for n in comparisons):
+    if not donor and any(_identity_filter(n, tables, "donor") for n in comparisons):
         errors.append("SQL added a donor filter not requested by the specification")
-    if role != "receiving_ministry" and any(_identity_filter(n, tables, "receiving_ministry") for n in comparisons):
+    if not receiver and any(_identity_filter(n, tables, "receiving_ministry") for n in comparisons):
         errors.append("SQL added a ministry filter not requested by the specification")
     start, end = spec.get("start_date"), spec.get("exclusive_end_date")
     allowed_dates = {(("sfpayments", "paymentdate"), exp.GTE, start),
@@ -271,6 +293,12 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
             errors.append(f"{metric} requires {expected_type.__name__.upper()} AS {ALIASES[metric]}")
         elif metric in {"total", "average"} and _column(value.this, tables) != ("sfpayments", "paymentamount"):
             errors.append("total/average must calculate sfpayments.paymentamount without changing the amount")
+        elif metric == "count" and spec.get("result_entity") == "ministry":
+            if not isinstance(value.this, exp.Distinct) or _refs(value, tables) != {("sf_ministries", "sfid")}:
+                errors.append("ministry count must count DISTINCT official ministry IDs")
+        elif metric == "count" and spec.get("result_entity") == "donor":
+            if not isinstance(value.this, exp.Distinct) or _refs(value, tables) != {("sf_contacts", "sfid")}:
+                errors.append("donor count must count DISTINCT contact IDs, not payments")
         elif metric == "count" and not isinstance(value.this, exp.Star) and _column(value.this, tables) not in {
             ("sfpayments", "id"), ("sfpayments", "sfid")
         }:
@@ -298,6 +326,16 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
             errors.append("donor list must return the donor name")
         if any(t != "sf_contacts" for t, c in fields if t):
             errors.append("donor list projections must describe donors, not individual payments")
+    elif spec.get("operation") == "ministry_list":
+        if group or any(p.find(exp.AggFunc) for p in tree.expressions):
+            errors.append("ministry list request was changed into an aggregate")
+        if not tree.args.get("distinct"):
+            errors.append("ministry list must return DISTINCT ministries, not one row per payment")
+        fields = set().union(*(_refs(p, tables) for p in tree.expressions))
+        if not {("sf_ministries", "sfid"), ("sf_ministries", "name")}.issubset(fields):
+            errors.append("ministry list must include the official ministry ID and name")
+        if any(t != "sf_ministries" for t, c in fields if t):
+            errors.append("ministry list projections must describe ministries, not payments")
     elif spec.get("result_shape") == "detail":
         if group or any(p.find(exp.AggFunc) for p in tree.expressions):
             errors.append("detail request was changed into an aggregate")
@@ -305,3 +343,35 @@ def semantic_sql_errors(sql: str, spec: dict) -> list[str]:
         if not {("sfpayments", "paymentamount"), ("sfpayments", "paymentdate")}.issubset(fields):
             errors.append("payment details must return paymentamount and paymentdate")
     return list(dict.fromkeys(errors))
+
+def _ministry_sql_errors(sql: str, spec: dict) -> list[str]:
+    """Protect the count/list distinction on the existing ministry route."""
+    try:
+        statements = parse(sql, read="mysql")
+        if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+            return ["ministry report requires one SELECT"]
+        tree = statements[0]
+        tables = _tables(tree)
+        if "sf_ministries" not in tables.values():
+            return ["ministry report must use the ministry records"]
+        if spec.get("metric") == "count":
+            projection = next((p for p in tree.expressions if p.alias.lower() == "record_count"), None)
+            value = projection.this if isinstance(projection, exp.Alias) else None
+            if not isinstance(value, exp.Count):
+                return ["ministry count requires COUNT AS record_count"]
+            if len(tables) > 1 and not isinstance(value.this, exp.Distinct):
+                return ["a joined ministry count must count DISTINCT official ministry IDs"]
+            if not isinstance(value.this, exp.Star) and _refs(value, tables) != {("sf_ministries", "sfid"),}:
+                return ["count official ministry records, not amounts or names"]
+            if tree.args.get("group") or tree.args.get("limit"):
+                return ["ministry count must not have GROUP BY or LIMIT"]
+        elif spec.get("result_shape") == "detail":
+            # Existing qualified ministry reports can contain aggregates per
+            # ministry. Only reject a scalar aggregate masquerading as a list.
+            if not tree.args.get("group") and any(p.find(exp.AggFunc) for p in tree.expressions):
+                return ["ministry list request must return rows, not an aggregate"]
+            if not any(("sf_ministries", "name") in _refs(p, tables) for p in tree.expressions):
+                return ["ministry list must return ministry names"]
+        return []
+    except Exception:
+        return ["ministry SQL could not be verified"]

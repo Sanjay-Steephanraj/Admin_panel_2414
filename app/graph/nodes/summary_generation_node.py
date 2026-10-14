@@ -3,6 +3,7 @@ graph/nodes/summary_generation_node.py
 """
 
 import logging
+import html
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 def _no_results_message(spec: dict) -> str:
     name = spec.get("entity_name") or spec.get("entity_code")
     entity = ((f" from {name}" if spec.get("entity_role") == "donor" else f" for {name}") if name else "")
+    if spec.get("donor_constraint"):
+        donor = spec["donor_constraint"].get("entity_name") or spec["donor_constraint"].get("entity_code")
+        if donor:
+            entity = f" from {donor}" + entity
     period = spec.get("period_label") or str(spec.get("period_name") or "all_time").replace("_", " ")
     start, end = spec.get("start_date"), spec.get("exclusive_end_date")
     if start and end:
@@ -34,12 +39,31 @@ def _no_results_message(spec: dict) -> str:
         return f"No ministries were found{entity} during {period}{extra}."
     return f"No recorded{status} payments were found{entity} during {period}{extra}."
 
+def _markdown_cell(value) -> str:
+    # Entity encoding keeps delimiters and HTML inside their original cell.
+    text = html.escape(str(value) if value is not None else "", quote=False)
+    return text.replace("|", "&#124;").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
+
 def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
     if not rows:
         return ""
-    keys = list(rows[0].keys())
-    headers = [k.replace("_", " ").title() for k in keys]
     spec = query_spec or {}
+    keys = list(rows[0].keys())
+    if (spec.get("result_entity") == "ministry"
+            and spec.get("operation") in {"ministry_list", "list"}
+            and not spec.get("display_detail")):
+        name_key = next((key for key in keys if key.lower() in {"ministry_name", "name"}), None)
+        if name_key:
+            names = [str(row.get(name_key) or "").strip().casefold() for row in rows]
+            keys = [name_key]
+            if len(set(names)) < len(names):
+                code_key = next((key for key in rows[0] if key.lower() in {"giftcode", "gift_code", "ministry_code"}), None)
+                id_key = next((key for key in rows[0] if key.lower() in {"ministry_id", "sfid"}), None)
+                if code_key and all(row.get(code_key) for row in rows):
+                    keys.append(code_key)
+                elif id_key:
+                    keys.append(id_key)
+    headers = [_markdown_cell(k.replace("_", " ").title()) for k in keys]
     title = (
         "Donor details" if spec.get("result_entity") == "donor" else
         "Ministry details" if spec.get("result_entity") == "ministry" else
@@ -50,7 +74,7 @@ def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
     out = [f"{title} ({len(rows)} rows):", "", "| " + " | ".join(headers) + " |",
            "| " + " | ".join("---" for _ in keys) + " |"]
     for row in rows:
-        out.append("| " + " | ".join(str(row.get(k, "") if row.get(k) is not None else "") for k in keys) + " |")
+        out.append("| " + " | ".join(_markdown_cell(row.get(k)) for k in keys) + " |")
     return "\n".join(out)
 
 

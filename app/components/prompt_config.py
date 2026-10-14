@@ -58,6 +58,13 @@ QUERY RULES — follow strictly:
     Do not add m.name, m.giftcode, p.ministryid, or any second ministry predicate in WHERE.
     Ministry names/codes must already be resolved to entity_id before SQL generation;
     do not reconstruct a ministry filter from raw question text.
+    A donor_constraint is an ADDITIONAL donor restriction, not a replacement
+    for the receiving ministry. Apply both using the documented relationship joins.
+    When result_entity is ministry and subject is payment, list DISTINCT
+    m.sfid and m.name (plus requested ministry fields), or COUNT(DISTINCT m.sfid)
+    AS record_count for a ministry count. Do not return individual payment rows.
+    A directory ministry count uses COUNT(*) AS record_count from sf_ministries;
+    an explicit ministry list returns rows, not a sum or count.
 14. When filtering by a donor's name, follow these EXACT rules based on the input:
 
     CASE A — Full name given (e.g. 'Daniel Karunakaran', 'Martin Gauss', 'Donald Gordon'):
@@ -124,13 +131,19 @@ QUERY RULES — follow strictly:
       dedicated analytical module outside this query engine. If asked to identify
       donors at risk of churning, lapsing, or becoming inactive, output exactly: UNCLEAR
 20. Follow the structured result_shape and metric. Total: SUM(p.paymentamount) AS total_amount.
-    Count: COUNT(*) AS record_count. Average: AVG(p.paymentamount) AS average_amount.
-    Scalars have no GROUP BY or LIMIT. Ministry reports select m.name AS ministry_name,
+    Payment count: COUNT(*) AS record_count. A payment-based ministry count uses
+    COUNT(DISTINCT m.sfid) AS record_count. Average: AVG(p.paymentamount) AS average_amount.
+    A payment-based donor count uses COUNT(DISTINCT c.sfid) AS record_count,
+    joining p.oppsfid = o.sfid and o.primarycontact = c.sfid. A short Count
+    after a donor list counts its distinct donors, retaining the same filters.
+    Scalars have no GROUP BY or LIMIT. Grouped ministry reports select m.name AS ministry_name,
     group by m.sfid, m.name, and use the requested aggregate alias.
     Payment details return at least p.paymentamount and p.paymentdate.
     Do not add donor, ministry, status, or date filters not present in the specification.
     A paid status is p.paid = 1; unpaid is p.paid = 0. Do not infer paid from the
-    verb 'paid' or 'received' alone. No requested status means no paid predicate.
+    verb 'paid' or 'received' alone. When status is not stated, the resolved
+    specification defaults to paid and requires p.paid = 1. An explicit
+    paid-and-unpaid request is the only route with no status predicate.
     Use one direct SELECT with the documented joins for these payment reports.
   """
 
@@ -148,7 +161,7 @@ INTENT_SUMMARY_INSTRUCTIONS: dict[str, str] = {
     "payment": (
         "Summarize payment activity clearly — amounts received, dates, methods, and status. "
         "Mention any totals, outstanding amounts, or trends. "
-        "Flag any pending or failed payments if present."
+        "Do not infer failed, pending, refunded or reversed outcomes from paid/unpaid."
     ),
     "opportunity": (
         "Summarize the donation pipeline — opportunity names, stages, pledged amounts, "

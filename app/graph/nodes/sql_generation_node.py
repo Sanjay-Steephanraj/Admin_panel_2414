@@ -288,18 +288,17 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
         # History is NOT passed to SQL generation because the question has
         # already been expanded/contextualized in the prior node (~500-1000
         # tokens saved).
-        messages_raw = build_sql_generation_prompt(
-            question, intent, retry_feedback, history=None,
-            query_spec=state.get("query_spec") or {},
-        )
-        messages = [
-            SystemMessage(content=messages_raw[0]["content"]),
-            HumanMessage(content=messages_raw[1]["content"]),
-        ]
-
-        llm = get_llm()
-        response = llm.invoke(messages)
-        raw_sql = response.content.strip()
+        query_spec = state.get("query_spec") or {}
+        from components.report_rules import special_report_sql
+        fixed_sql = special_report_sql(query_spec)
+        if fixed_sql is None:
+            messages_raw = build_sql_generation_prompt(question, intent, retry_feedback, history=None, query_spec=query_spec)
+            messages = [SystemMessage(content=messages_raw[0]["content"]), HumanMessage(content=messages_raw[1]["content"])]
+            llm = get_llm()
+            response = llm.invoke(messages)
+            raw_sql = response.content.strip()
+        else:
+            raw_sql = fixed_sql
 
         # ── Strip markdown fences ──
         if raw_sql.startswith("```"):
@@ -318,8 +317,9 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
                 "error":                "Question too ambiguous to generate SQL",
             }
 
-        query_spec = state.get("query_spec") or {}
-        if query_spec.get("subject") == "payment":
+        if fixed_sql is not None:
+            final_sql = raw_sql
+        elif query_spec.get("subject") == "payment":
             # The resolved structured specification is authoritative for all
             # payment SQL. Do not inject raw ministry names/codes alongside it.
             final_sql = enforce_entity_filter(raw_sql, query_spec)
