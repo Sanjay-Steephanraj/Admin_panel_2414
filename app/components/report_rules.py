@@ -33,9 +33,13 @@ def special_report_sql(spec: dict) -> str | None:
         raise ValueError("This qualifying report supports a list or a count")
     if kind == "missing_ministry_code":
         where = "(m.giftcode IS NULL OR TRIM(m.giftcode) = '')"
+        from components.report_options import filter_predicates
+        extra = filter_predicates(spec.get("filters") or {}, {"sf_ministries": "m"})
+        if extra:
+            where += " AND " + " AND ".join(extra)
         if metric == "count":
             return f"SELECT COUNT(*) AS record_count FROM sf_ministries m WHERE {where}"
-        return ("SELECT m.sfid AS ministry_id, m.name AS ministry_name "
+        return ("SELECT m.sfid AS ministry_id, m.name AS ministry_name, m.giftcode AS gift_code "
                 f"FROM sf_ministries m WHERE {where} ORDER BY m.name LIMIT 100")
 
     if spec.get("status") != "paid":
@@ -51,9 +55,14 @@ def special_report_sql(spec: dict) -> str | None:
         "JOIN sf_opportunities o ON p.oppsfid = o.sfid",
         "JOIN sf_contacts c ON o.primarycontact = c.sfid",
     ]
-    if kind == "multi_ministry_donor" or receiver:
+    ministry_needed = kind == "multi_ministry_donor" or receiver or any(
+        key in (spec.get("filters") or {}) for key in ("description_missing", "ministry_active"))
+    if ministry_needed:
         joins.append("JOIN sf_ministries m ON p.ministryid = m.sfid")
     conditions = ["p.paid = 1", *_date_bounds(spec)]
+    from components.report_options import FIELD_COLUMNS, filter_predicates
+    conditions.extend(filter_predicates(spec.get("filters") or {}, {
+        "sfpayments": "p", "sf_contacts": "c", **({"sf_ministries": "m"} if ministry_needed else {})}))
     if receiver:
         official_id = receiver.get("entity_id")
         if not official_id:
@@ -69,6 +78,19 @@ def special_report_sql(spec: dict) -> str | None:
         inner = "SELECT c.sfid " + source + grouped + having
         return f"SELECT COUNT(*) AS record_count FROM ({inner}) AS qualifying_donors"
     count_alias = "donation_count" if kind == "repeat_donor" else "ministry_count"
+    extra_columns = []
+    for field in spec.get("display_columns") or []:
+        if field == "donor_name":
+            continue
+        columns = FIELD_COLUMNS.get(field)
+        if not columns or any(table != "sf_contacts" for table, _ in columns):
+            raise ValueError("This donor report can only display donor attributes")
+        for _, column in sorted(columns):
+            if column not in {"sfid", "firstname", "lastname"}:
+                extra_columns.append(f"c.{column} AS {column}")
+    extras = ", " + ", ".join(dict.fromkeys(extra_columns)) if extra_columns else ""
+    if extra_columns:
+        grouped += ", " + ", ".join(item.split(" AS ")[0] for item in dict.fromkeys(extra_columns))
     return (f"SELECT c.sfid AS donor_id, c.firstname AS first_name, "
-            f"c.lastname AS last_name, {counted} AS {count_alias} "
+            f"c.lastname AS last_name, {counted} AS {count_alias}{extras} "
             + source + grouped + having + f" ORDER BY {count_alias} DESC LIMIT 100")

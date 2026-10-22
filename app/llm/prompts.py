@@ -116,7 +116,10 @@ def build_sql_generation_prompt(
     history_block = format_history_block(history or [])
 
     contract = query_spec or {}
+    from components.report_semantics import report_semantics_prompt
     system = f"""{DOMAIN_CONTEXT}
+
+{report_semantics_prompt()}
 
 You are an internal MySQL query engine for this system.
 Convert the admin's natural language question into a precise MySQL SELECT query.
@@ -128,6 +131,32 @@ status, and absolute start_date/exclusive_end_date are mandatory. Relative dates
 have already been resolved. Do not broaden filters. Use sfpayments for recorded
 donation/payment analytics; a receiving ministry joins sfpayments.ministryid to
 sf_ministries.sfid. For all_time add no paymentdate predicate.
+The filters object contains additional mandatory conditions. email_missing
+means (c.email IS NULL OR TRIM(c.email) = ''). description_missing uses the
+same missing-value rule on m.description. ministry_active selects m.isActive
+= 1 or 0. Do not invent other filters. Contact/profile queries use only
+sf_contacts and the explicit donor identity; donor history uses payments.
+Select each display_columns attribute as well as internal identity/name
+columns needed for validation. Do not replace a list with a scalar. When
+ranking is present, ORDER BY the aggregate alias in its requested direction.
+For every donor/contact list, select c.sfid AS donor_sfid and both c.firstname
+and c.lastname (separately, or combined AS donor_name). donorID is not a
+substitute for sfid. These identity/name fields are required even when the
+user requests only email or another displayed field; the renderer hides
+internal identity fields and applies the requested display_columns.
+Contact counts instead use COUNT(*) AS record_count without these list fields.
+For group_by=month, override detail/profile column instructions above: select
+only DATE_FORMAT(p.paymentdate, '%Y-%m') AS month and the requested numeric
+aggregate alias (total_amount, average_amount or record_count). For example:
+SELECT DATE_FORMAT(p.paymentdate, '%Y-%m') AS month,
+       SUM(p.paymentamount) AS total_amount
+FROM sfpayments p WHERE p.paid = 1
+GROUP BY DATE_FORMAT(p.paymentdate, '%Y-%m') ORDER BY month ASC LIMIT 100
+This example is a paid, all-time total only; adapt the aggregate and preserve
+ALL conditions from the actual specification. Use the existing verified joins
+when donor/ministry conditions or distinct donor/ministry counts require them.
+Do not copy profile identity columns into a monthly SELECT, drop undated rows
+from an all-time report, merge years or label monthly payments recurring.
 
 {schema_block}
 
@@ -163,6 +192,10 @@ A SQL query was executed and returned an error or failed semantic validation. Di
 The structured query specification is authoritative. Repair missing or changed
 entity role, canonical ministry constraint, absolute period boundaries, aggregate,
 grouping, status, or result shape; executable SQL is not automatically correct.
+Monthly reports use DATE_FORMAT(p.paymentdate, '%Y-%m') AS month with one
+numeric aggregate, matching GROUP BY and ORDER BY month ASC LIMIT 100.
+Preserve the specification's filters. Do not convert monthly grouping into
+recurring classification, ministry grouping or a scalar total.
 
 QUERY SPECIFICATION:
 {query_spec or {}}

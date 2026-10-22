@@ -42,9 +42,16 @@ QUERY RULES — follow strictly:
    - sf_contacts → sf_opportunities  :  c.sfid = o.primarycontact
    - sf_opportunities → sfpayments   :  o.sfid = p.oppsfid
    - sfpayments → sf_ministries      :  p.ministryid = m.sfid
-6. Use LEFT JOIN by default; use INNER JOIN only when a match is required
-7. List queries: add LIMIT 100
-8. Aggregate queries (totals, counts, averages): no LIMIT
+6. Use LEFT JOIN by default for optional payment-detail display fields.
+   Ministry activity lists, ministry-grouped aggregates and rankings require
+   actual linked ministry records and contributing payments: use the verified
+   INNER JOIN, or equivalent non-NULL source-identity guards. Do not output an
+   unmatched-payment group as a blank ministry, or zero-activity directory rows.
+   Ordinary payment totals and histories must still retain unmatched payments.
+7. List and grouped table queries: add LIMIT 100
+8. Single-value aggregate queries (totals, counts, averages): no LIMIT
+   The application also enforces the list bound; never add an offset unless
+   the structured report explicitly supports that pagination.
 9. Donor full name: CONCAT(c.firstname, ' ', c.lastname) AS donor_name
 10. Boolean columns (paid, isActive, donotcall etc.): compare with 1 or 0
 11. For payment periods, use the specification's exact boundaries:
@@ -145,6 +152,24 @@ QUERY RULES — follow strictly:
     specification defaults to paid and requires p.paid = 1. An explicit
     paid-and-unpaid request is the only route with no status predicate.
     Use one direct SELECT with the documented joins for these payment reports.
+21. Use only supported reporting fields. Never select or filter card, bank,
+    SSN, credential, raw JSON or payment-payload fields, even if the schema
+    describes them. They are not part of Admin AI reports. Ordinary payment
+    details use paymentamount, paymentdate, paid, payment_method and relevant
+    ministry identity/name/code; add requested donor/contact fields only.
+    Do not include cardlast4 or bank_accounts in a payment-detail query.
+22. When group_by is month, select DATE_FORMAT(p.paymentdate, '%Y-%m') AS month
+    and exactly one numeric aggregate using rule 20's alias. GROUP BY that
+    same year-month expression and ORDER BY month ASC LIMIT 100. Never group
+    by month number alone: January in different years must stay separate.
+    Apply the specification's period, paid/unpaid, donor, ministry and other
+    conditions unchanged. Do not add paymentdate IS NOT NULL to an all-time
+    report. Do not fill missing months with invented zero rows. Do not add
+    HAVING, rollups, DISTINCT on the whole SELECT, extra group dimensions or
+    detail/profile columns. A donor/ministry count still counts DISTINCT IDs
+    within each month. Do not use SQL FORMAT or add dollar signs to numbers;
+    the response renderer formats currency. Monthly grouping is not recurring
+    donation classification.
   """
 
 INTENT_SUMMARY_INSTRUCTIONS: dict[str, str] = {

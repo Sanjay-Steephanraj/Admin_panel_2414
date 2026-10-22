@@ -175,6 +175,9 @@ def resolve_churn_route(
       {"offset": int, "limit": int | None, "entities_override": dict | None}
     """
     last_turn = history[-1] if history else None
+    if (last_turn and last_turn.get("sql") == "CHURN_ANALYSIS" and
+            re.fullmatch(r"\s*(?:(?:and|then|now)\s+)?(?:count|how many)(?: instead)?\s*[?.]?\s*", raw_question, re.I)):
+        return {"offset": 0, "limit": None, "entities_override": last_turn.get("churn_entities"), "operation": "count"}
     followup_count = detect_churn_followup(raw_question)
     if followup_count is not None and last_turn and last_turn.get("sql") == "CHURN_ANALYSIS":
         return {
@@ -186,6 +189,20 @@ def resolve_churn_route(
         limit = (extract_requested_count(raw_question)
                  or extract_requested_count(normalized_question))
         return {"offset": 0, "limit": limit, "entities_override": None}
+    return None
+
+
+def churn_request_issue(spec: dict) -> str | None:
+    """The existing cadence analysis is not an arbitrary no-giving report."""
+    from components.query_spec import entity_constraints
+    if spec.get("start_date") or spec.get("period_ambiguity") or spec.get("period_name") not in {None, "all_time", "inactivity_window"}:
+        return "The inactivity report compares donors with their usual giving pattern. It can’t apply a custom date cutoff or reporting period. Please ask for the usual-pattern inactivity report, optionally for a ministry."
+    if spec.get("status") not in {None, "paid"} or ("status" in spec.get("explicit_fields", []) and spec.get("status") is None):
+        return "The inactivity report uses paid donations. It can’t analyse unpaid or combined-status payments."
+    if entity_constraints(spec).get("donor"):
+        return "The inactivity report can list donors across ministries or for one ministry. It can’t apply a named-donor filter yet."
+    if spec.get("filters") or spec.get("display_columns") or spec.get("ranking"):
+        return "The inactivity report has its own giving-pattern calculation and display. It can’t apply those additional conditions or column choices."
     return None
 
 

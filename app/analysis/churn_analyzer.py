@@ -33,7 +33,8 @@ FREQUENCY_HISTORY_DAYS = 1461  # use up to 48 months of donation history for fre
 RECENCY_LIMIT_DAYS     = 730   # only flag donors whose latest donation was within the past 24 months
 
 
-def build_churn_sql(ministry_code: str | None = None, ministry_name: str | None = None) -> str:
+def build_churn_sql(ministry_code: str | None = None, ministry_name: str | None = None,
+                    ministry_id: str | None = None, as_of=None) -> str:
     """Build the raw per-donor payment-history query."""
     sql = (
         "SELECT\n"
@@ -54,11 +55,14 @@ def build_churn_sql(ministry_code: str | None = None, ministry_name: str | None 
     )
 
     conditions = []
-    if ministry_code:
+    if ministry_id:
+        official = str(ministry_id).replace("\\", "\\\\").replace("'", "''")
+        conditions.append(f"m.sfid = '{official}'")
+    if ministry_code and not ministry_id:
         code = re.sub(r"[^A-Za-z0-9]", "", ministry_code).upper()
         if code:
             conditions.append(f"UPPER(m.giftcode) = '{code}'")
-    if ministry_name:
+    if ministry_name and not ministry_id:
         # Keep only a leading run of safe characters; discard the rest. Pure
         # char-filtering leaves alphanumeric SQL keywords (e.g. DROP) intact in
         # the LIKE literal, so we truncate at the first disallowed character to
@@ -78,6 +82,9 @@ def build_churn_sql(ministry_code: str | None = None, ministry_name: str | None 
         sql += f"  AND {joined}\n"
 
     sql += "ORDER BY c.sfid ASC, p.paymentdate ASC"
+    if as_of is not None:
+        anchor = datetime.date.fromisoformat(str(as_of))
+        sql = sql.replace("CURDATE()", "'" + anchor.isoformat() + "'")
     return sql
 
 
@@ -265,7 +272,7 @@ def classify_churn_risk(payment_rows: list[dict], ministry_scoped: bool = False,
     return results
 
 
-def run_churn_analysis(entities: dict | None, offset: int = 0, limit: int | None = None) -> dict:
+def run_churn_analysis(entities: dict | None, offset: int = 0, limit: int | None = None, *, as_of=None) -> dict:
     """
     End-to-end deterministic churn analysis.
 
@@ -294,7 +301,11 @@ def run_churn_analysis(entities: dict | None, offset: int = 0, limit: int | None
         ministry_name = entities.get("ministry_name")
         ministry_scoped = bool(ministry_code or ministry_name)
 
-        sql = build_churn_sql(ministry_code, ministry_name)
+        sql = build_churn_sql(ministry_code, ministry_name, entities.get("ministry_id"), as_of)
+        from security.domain_guard import domain_guard
+        safe, reason = domain_guard.check_sql(sql)
+        if not safe:
+            raise ValueError(reason)
         rows, err = execute_query(sql)
         if err:
             logger.error("churn analysis db error: %s", err)
@@ -321,13 +332,14 @@ def run_churn_analysis(entities: dict | None, offset: int = 0, limit: int | None
                 "total_at_risk": 0,
             }
 
-        all_at_risk = classify_churn_risk(rows, ministry_scoped=ministry_scoped)
+        today = datetime.date.fromisoformat(str(as_of)) if as_of is not None else datetime.date.today()
+        all_at_risk = classify_churn_risk(rows, ministry_scoped=ministry_scoped, today=today)
         page = all_at_risk[offset : offset + limit]
 
         scope_label = ministry_name or ministry_code or None
         summary = build_churn_summary(
             page, scope_label, total_at_risk=len(all_at_risk),
-            analysis_date=datetime.date.today(),
+            analysis_date=today,
             offset=offset,
         )
 

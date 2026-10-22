@@ -14,9 +14,9 @@ SQL guard runs three validation layers:
 """
 import re
 import logging
+from sqlglot import exp, parse
 from components.intent_config import get_intent_keyword_map
-from dynamic.schema_resolver import get_active_table_names
-from components.context_enrichment import ALLOWED_TABLES
+from dynamic.schema_resolver import get_active_allowed_tables, get_active_table_names
 
 logger = logging.getLogger(__name__)
 
@@ -113,13 +113,14 @@ def _check_columns(sql: str, alias_map: dict[str, str]) -> tuple[bool, str]:
     Validates every alias.column reference in the SQL against the schema.
     Case-insensitive check.
     """
+    allowed_schema = get_active_allowed_tables()
     allowed_columns_lower: dict[str, set[str]] = {
         tbl.lower(): {c.lower() for c in meta["columns"].keys()}
-        for tbl, meta in ALLOWED_TABLES.items()
+        for tbl, meta in allowed_schema.items()
     }
     allowed_columns_orig: dict[str, list[str]] = {
         tbl.lower(): sorted(meta["columns"].keys())
-        for tbl, meta in ALLOWED_TABLES.items()
+        for tbl, meta in allowed_schema.items()
     }
 
     for match in _QUALIFIED_COL_RE.finditer(sql):
@@ -294,6 +295,26 @@ class DomainGuard:
         if not sql or not sql.strip():
             return False, "Generated SQL is empty."
 
+        # A prompt is not a read-only boundary. Apply the same parsed-statement
+        # rule to every generated report, not only payment analytics.
+        try:
+            statements = parse(sql, read="mysql")
+            if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+                return False, "Generated reports require one read-only SELECT statement."
+            tree = statements[0]
+            if any(type(node).__name__ in {
+                "Into", "Lock", "Insert", "Update", "Delete", "Merge", "Command",
+                "Create", "Drop", "Alter", "Transaction", "Set", "PropertyEQ",
+            } for node in tree.walk()):
+                return False, "Generated SELECT contains a disallowed operation."
+            if any(table.db or table.catalog for table in tree.find_all(exp.Table)):
+                return False, "Cross-database table references are not permitted."
+            if any(node.name.upper() not in {"CONCAT_WS", "TIMESTAMPDIFF", "DATEDIFF"}
+                   for node in tree.find_all(exp.Anonymous)):
+                return False, "Unverified SQL functions are not permitted in generated reports."
+        except Exception:
+            return False, "Generated SQL could not be parsed as a read-only SELECT."
+
         # Strip quoted string literals once; all SQL-structure scans operate on
         # the skeleton so data inside literals cannot spoof FROM/JOIN tables,
         # qualified column refs, or dangerous-pattern matches.
@@ -307,7 +328,7 @@ class DomainGuard:
         # Layer 2 — table allowlist
         allowed    = set(get_active_table_names())
         alias_map  = _build_alias_map(sql_skeleton)
-        referenced = set(alias_map.values())          # canonical table names
+        referenced = {table.name.lower() for table in tree.find_all(exp.Table)}
 
         logger.info(f"Tables referenced: {referenced} | allowed: {allowed}")
 

@@ -4,6 +4,7 @@ graph/nodes/summary_generation_node.py
 
 import logging
 import html
+import re
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -44,10 +45,36 @@ def _markdown_cell(value) -> str:
     text = html.escape(str(value) if value is not None else "", quote=False)
     return text.replace("|", "&#124;").replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br>")
 
+_MONEY_COLUMNS = {"paymentamount", "amount", "donationamount", "totalamount", "averageamount"}
+
+
+def _currency(value) -> str:
+    """Display only: database values remain numeric for later calculations."""
+    if value is None or isinstance(value, str) and not value.strip():
+        return ""
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite():
+            raise ValueError("Non-finite monetary result")
+        return f"${amount:,.2f}"
+    except (InvalidOperation, TypeError) as exc:
+        raise ValueError("Invalid monetary result") from exc
+
+
+def _display_cell(key: str, value) -> str:
+    name = re.sub(r"[^a-z0-9]", "", key.lower())
+    return _markdown_cell(_currency(value) if name in _MONEY_COLUMNS else value)
+
+
 def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
     if not rows:
         return ""
     spec = query_spec or {}
+    monthly = spec.get("group_by") == "month"
+    has_undated = monthly and any(value is None for row in rows for key, value in row.items() if key.lower() == "month")
+    if spec:
+        from components.report_options import display_rows
+        rows = display_rows(rows, spec)
     keys = list(rows[0].keys())
     if (spec.get("result_entity") == "ministry"
             and spec.get("operation") in {"ministry_list", "list"}
@@ -64,17 +91,29 @@ def _markdown_table(rows: list[dict], query_spec: dict | None = None) -> str:
                 elif id_key:
                     keys.append(id_key)
     headers = [_markdown_cell(k.replace("_", " ").title()) for k in keys]
-    title = (
-        "Donor details" if spec.get("result_entity") == "donor" else
-        "Ministry details" if spec.get("result_entity") == "ministry" else
-        "Payment details"
-        if spec.get("result_shape") == "detail"
-        else "Payments by " + str(spec.get("group_by") or "group")
-    )
+    if monthly:
+        metric, entity = spec.get("metric"), spec.get("result_entity")
+        title = ("Monthly donation totals" if metric == "total" else
+                 "Monthly average donation amounts" if metric == "average" else
+                 "Monthly " + {"donor": "donor", "ministry": "ministry"}.get(entity, "payment") + " counts")
+    else:
+        title = (
+            "Donor details" if spec.get("result_entity") == "donor" else
+            "Ministry details" if spec.get("result_entity") == "ministry" else
+            "Payment details"
+            if spec.get("result_shape") == "detail"
+            else "Payments by " + str(spec.get("group_by") or "group")
+        )
     out = [f"{title} ({len(rows)} rows):", "", "| " + " | ".join(headers) + " |",
            "| " + " | ".join("---" for _ in keys) + " |"]
     for row in rows:
-        out.append("| " + " | ".join(_markdown_cell(row.get(k)) for k in keys) + " |")
+        out.append("| " + " | ".join(_display_cell(k, row.get(k)) for k in keys) + " |")
+    if monthly:
+        out.extend(("", "Months with no matching payments are not shown; an omitted month does not establish a zero total."))
+        if has_undated:
+            out.extend(("", "‘Date not recorded’ contains matching payments without a recorded payment date."))
+        if spec.get("metric") == "count" and spec.get("result_entity") in {"donor", "ministry"}:
+            out.extend(("", "Each month counts distinct " + ("donors" if spec["result_entity"] == "donor" else "ministries") + "; the same one can appear in more than one month."))
     return "\n".join(out)
 
 
@@ -138,7 +177,12 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
     if result_shape in {"detail", "grouped"}:
         displayed = state.get("displayed_count", len(db_result))
         total = state.get("total_count", displayed)
-        summary = _markdown_table(db_result, query_spec)
+        try:
+            summary = _markdown_table(db_result, query_spec)
+        except ValueError:
+            return {**state, "summary": user_error_message("db_failure"),
+                    "validation_passed": False, "query_outcome": "retrieval_error",
+                    "displayed_count": 0, "total_count": 0}
         if total > displayed:
             summary = f"Showing {displayed} of {total} records.\n\n" + summary
         return {**state, "summary": summary, "query_outcome": "success"}
@@ -153,8 +197,8 @@ def summary_generation_node(state: NLSQLState) -> NLSQLState:
                     summary = "An average could not be calculated from the matching payment records."
                 return {**state, "summary": summary + ("\n\n" if summary else "") + _no_results_message(query_spec),
                         "query_outcome": "no_results", "displayed_count": 0, "total_count": 0}
-            if metric == "total": summary = f"Total: **${Decimal(str(value)):,.2f}**"
-            elif metric == "average": summary = f"Average: **${Decimal(str(value)):,.2f}**"
+            if metric == "total": summary = f"Total: **{_currency(value)}**"
+            elif metric == "average": summary = f"Average: **{_currency(value)}**"
             else: summary = f"Count: **{int(value):,}**"
             return {**state, "summary": summary, "query_outcome": "success"}
         except (KeyError, IndexError, TypeError, ValueError, InvalidOperation):

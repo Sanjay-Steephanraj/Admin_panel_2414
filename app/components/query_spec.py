@@ -19,6 +19,8 @@ _ENTITY_STOP = re.compile(
     r"\s+(?:to|for|in|on|during|this|last|all|today|yesterday|with|whose|"
     r"receive[ds]?|donate[ds]?|contribute[ds]?|paid)\b|[,?!]", re.I,
 )
+DONOR_LOOKUP = re.compile(r"\b(?:donor|giver|contact)(?:'s)?\s+(?:donation\s+)?(?:history|profile|details?|information)\b", re.I)
+DONOR_HISTORY = re.compile(r"\b(?:donor|giver)(?:'s)?\s+(?:donation\s+)?history\b", re.I)
 _ENTITY_FIELDS = ("entity_role", "entity_id", "entity_name", "entity_code", "resolution_outcome")
 _PERIOD_FIELDS = ("period_name", "period_label", "start_date", "exclusive_end_date", "period_ambiguity")
 _GIVER_LIST_RE = re.compile(r"\b(?:list\s+(?:of\s+|all\s+)?|show\s+(?:me\s+|us\s+)?|"r"get\s+(?:the\s+)?|which\s+)givers?\b", re.I,)
@@ -49,6 +51,16 @@ _UNSUPPORTED_OUTCOME_RE = re.compile(
 )
 _LOCATION_WORDS_RE = re.compile(r"\b(?:region|regions|regional|countries|country|continent|geograph(?:y|ic|ical))\b", re.I)
 USER_FACING_LIMITS = {
+    "analytics_capability": (
+        "I can show donation lists, counts, totals and averages, including monthly "
+        "or ministry breakdowns. I can’t reliably produce that particular analysis yet."
+    ),
+    "pcn_activity": "I can report recorded donations and donor or ministry details, but I don’t have verified PCN activity information for that report.",
+    "setup_state": "I can show ministry details, but I can’t reliably confirm PCN setup or donation-configuration status here.",
+    "salesforce_sync": "I can report recorded donations, but I can’t reliably identify donations still waiting to be updated in Salesforce here.",
+    "profile_definition": "I can’t infer an overall profile-completeness rule. Please ask a new question naming the fields to check, such as ‘List ministries with missing descriptions.’",
+    "profile_fields": "I can’t reliably check logo information here, so I can’t answer the full logo-based profile report. You can ask for ministries with missing descriptions.",
+    "performance_definition": "Please restate the question using a specific measure, such as donation totals or counts for a period. I can’t infer a rule for which ministries need support or intervention.",
     "ministry_geography": (
         "I can’t reliably list ministries by country or region because their location "
         "information is incomplete here. If you give me a ministry name or gift code, "
@@ -73,6 +85,26 @@ _PAYMENT_FREQUENCY_RE = re.compile(
     r"one[-\s]?time|subscriptions?|single\s+(?:donations?|payments?|gifts?|contributions?))\b",
     re.I,
 )
+
+def ambiguous_schedule_request(question: str, identity_values: list[str] | None = None) -> bool:
+    """Veto a narrow cadence/giving ambiguity without choosing its meaning.
+
+    Report nouns distinguish 'monthly giving totals' from a qualifier such
+    as 'monthly giving payments'. The latter may select scheduled payments,
+    even if another clause also asks to group them by calendar month. Literal
+    donor/ministry names are data and must not trigger this grammar check.
+    Other phrasing remains with the existing model interpretation/review.
+    """
+    text = question
+    for value in identity_values or []:
+        if isinstance(value, str) and value.strip():
+            text = re.sub(r"(?<!\w)" + re.escape(value) + r"(?!\w)", " ", text, flags=re.I)
+    if _PAYMENT_FREQUENCY_RE.search(text):
+        return False
+    return bool(re.search(
+        r"\b(?:daily|weekly|monthly|quarterly|yearly|annual)\s+giving\b"
+        r"(?!\s+(?:totals?|counts?|averages?|breakdowns?|reports?|summaries)\b)", text, re.I))
+
 
 def _ministry_geography_requested(question: str) -> bool:
     if not re.search(r"\bministr(?:y|ies)\b", question, re.I):
@@ -99,7 +131,38 @@ def unsupported_request_reason(question: str) -> str | None:
         return "payment_outcome"
     if _ministry_geography_requested(question):
         return "ministry_geography"
+    q = question.lower()
+    if re.search(r"\bsalesforce\b", q) and re.search(r"\b(?:not|pending|waiting|unsynced|updated|synced)\b", q):
+        return "salesforce_sync"
+    if (re.search(r"\bpcn\b.*\b(?:setup|set up|onboard|onboarding)\b|\b(?:setup|set up|onboard\w*)\b.*\bpcn\b", q)
+            or re.search(r"\b(?:not|unconfigured|pending)\b.*\b(?:configured|configuration)\b.*\bdonations?\b", q)):
+        return "setup_state"
+    if (re.search(r"\b(?:engagement|followers?|onboard\w*|registrations?)\b", q)
+            or re.search(r"\bpcn\b.*\b(?:active|activity|joined|joining|signup)\b|\b(?:active|activity|joined|joining|signup)\b.*\bpcn\b", q)
+            or re.search(r"\b(?:posted|posting|posts|updates)\b", q)):
+        return "pcn_activity"
+    if re.search(r"\b(?:incomplete|complete|completeness)\s+profiles?\b|\bprofiles?\b.*\b(?:incomplete|completeness)\b", q):
+        return "profile_definition"
+    if re.search(r"\blogos?\b", q):
+        return "profile_fields"
+    if re.search(r"\bintervention\b|\bministries\b.*\bneed(?:ing)?\s+support\b", q):
+        return "performance_definition"
     return None
+
+def qualification_evidence(question: str) -> tuple[str | None, str]:
+    """Exact evidence from the existing approved qualification vocabulary.
+
+    This does not choose an LLM report or infer an unstated restriction. Keep
+    the same precedence as the deterministic specification builder.
+    """
+    for kind, pattern in (("missing_ministry_code", _MISSING_CODE_RE),
+                          ("multi_ministry_donor", _MULTI_MINISTRY_DONORS_RE),
+                          ("repeat_donor", _REPEAT_DONORS_RE)):
+        match = pattern.search(question)
+        if match:
+            return kind, match.group(0)
+    return None, ""
+
 
 def reporting_date() -> date:
     from config.settings import get_settings
@@ -107,7 +170,7 @@ def reporting_date() -> date:
 
 def resolve_ministry(spec: dict) -> tuple[dict, str | None]:
     """Resolve exactly one official receiver; DB errors never mean no match."""
-    if spec.get("subject") != "payment" or spec.get("entity_role") != "receiving_ministry" or not (spec.get("entity_name") or spec.get("entity_code")):
+    if spec.get("entity_role") != "receiving_ministry" or not (spec.get("entity_name") or spec.get("entity_code")):
         return spec, None
     if spec.get("entity_id") and spec.get("resolution_outcome") == "resolved":
         return spec, None
@@ -115,25 +178,33 @@ def resolve_ministry(spec: dict) -> tuple[dict, str | None]:
     raw = str(spec.get("entity_code") or spec.get("entity_name")).strip()
     candidates = [raw]
     if not spec.get("entity_code"):
-        short = re.sub(r"^ministry\s+(?:of|to|for)\s+|\s+ministry$", "", raw, flags=re.I).strip()
-        if short and short.lower() != raw.lower():
-            candidates.extend((short, short + " Ministry", "Ministry of " + short))
-        elif short:
-            candidates.extend((short + " Ministry", "Ministry of " + short))
+        short = re.sub(r"^(?:the\s+)?ministry\s+(?:of|to|for)\s+|\s+ministry$", "", raw, flags=re.I).strip()
+        if short:
+            candidates.extend((short, short + " Ministry", "Ministry of " + short, "The Ministry of " + short))
     candidates = list(dict.fromkeys(candidates))
     field = "giftcode" if spec.get("entity_code") else "name"
-    for candidate in candidates:
-        value = candidate.replace("\\", "\\\\").replace("'", "''")
-        rows, error = execute_query("SELECT sfid, name, giftcode FROM sf_ministries " f"WHERE LOWER(TRIM({field})) = LOWER('{value}') LIMIT 2")
-        if error:
+    values = [candidate.replace("\\", "\\\\").replace("'", "''") for candidate in candidates]
+    # Check all exact aliases together. Returning the first matching alias
+    # would hide a second official ministry with another accepted spelling.
+    expressions = [f"LOWER('{value}')" for value in values]
+    if not spec.get("entity_code"):
+        # Some official names include their own gift code as a display suffix.
+        # Compare exact forms using that row's code, never a substring search
+        # or a guessed code. Check all forms together to retain ambiguity.
+        expressions += [f"CONCAT(LOWER('{value}'), '{space}(', LOWER(TRIM(giftcode)), ')')"
+                        for value in values for space in (" ", "")]
+    predicates = ", ".join(expressions)
+    rows, error = execute_query("SELECT sfid, name, giftcode FROM sf_ministries "
+                               f"WHERE LOWER(TRIM({field})) IN ({predicates}) LIMIT 2")
+    if error:
+        return {**spec, "resolution_outcome": "retrieval_error"}, None
+    if len(rows) > 1:
+        return spec, "More than one ministry matches that name. Please provide its gift code."
+    if rows:
+        resolved = rows[0]
+        if not resolved.get("sfid"):
             return {**spec, "resolution_outcome": "retrieval_error"}, None
-        if len(rows) > 1:
-            return spec, "More than one ministry matches that name. Please provide its gift code."
-        if rows:
-            resolved = rows[0]
-            if not resolved.get("sfid"):
-                return {**spec, "resolution_outcome": "retrieval_error"}, None
-            return {**spec, "entity_id": resolved["sfid"], "entity_name": resolved["name"], "entity_code": resolved.get("giftcode"), "resolution_outcome": "resolved"}, None
+        return {**spec, "entity_id": resolved["sfid"], "entity_name": resolved["name"], "entity_code": resolved.get("giftcode"), "resolution_outcome": "resolved"}, None
     return {**spec, "resolution_outcome": "no_match"}, None
 
 def _next_month(start: date) -> date:
@@ -224,6 +295,12 @@ def _donor_name(question: str) -> str | None:
         r"\b(?:donated|contributed|paid)\s+by\s+(.+)",
         r"\b(?:did|has|have)\s+(.+?)\s+(?:donate[ds]?|contribute[ds]?|pay|paid)\b",
         r"^\s*(.+?)\s+(?:donated|contributed|paid)\b",
+        # The same two roles can appear in the opposite order. Keep this
+        # bound to a donation noun and an explicit receiver clause: a free
+        # "from ..." may instead introduce a reporting date range.
+        r"\b(?:donations?|payments?|contributions?|gifts?|transactions?)\s+"
+        r"(?:to|for)\s+.+?\s+(?:from|by)\s+(.+)",
+        r"\b(?:donor|giver|contact)(?:'s)?\s+(?:donation\s+)?(?:history|profile|details?|information)\s+(?:for|of|about)\s+(.+)",
     )
     for index, pattern in enumerate(patterns):
         match = re.search(pattern, question, re.I)
@@ -232,6 +309,7 @@ def _donor_name(question: str) -> str | None:
             if (re.match(rf"\d|(?:{_MONTH_RE})\s+\d|(?:today|yesterday|this|last|all)\b", name, re.I)
                     and not re.fullmatch(r"#?\d+", name)):
                 continue
+            if re.fullmatch(r"not|never|no", name, re.I): continue
             if name.split() and name.split()[0].lower() in {"show", "list", "get", "give", "how", "what", "which", "who", "are", "count", "total", "average", "all", "now", "also", "then", "please", "can", "could", "would", "donors", "givers"}: continue
             if index == 4 and re.search(r"\b(?:donors?|givers?|who|have|has)\b", name, re.I):
                 continue
@@ -278,7 +356,21 @@ def resolve_pending_reply(pending: dict | None, reply: str) -> tuple[str, dict |
     q = reply.strip()
     kind = pending.get("kind")
     spec = deepcopy(pending["query_spec"])
-    if kind == "year":
+    if kind in {"output", "ranking_metric"}:
+        choice = q.lower().strip(" .!?")
+        choice = re.sub(r"^please\s+|[,\s]+please$", "", choice).strip()
+        choices = ({"list": None, "a list": None, "show the list": None,
+                    "count": "count", "a count": "count", "number of donors": "count"}
+                   if kind == "output" else
+                   {"total": "total", "amount": "total", "total amount": "total", "total donation amount": "total",
+                    "count": "count", "number of donations": "count", "donation count": "count"})
+        if choice in choices:
+            spec["metric"] = choices[choice]
+            spec.pop("clarification", None)
+            spec.pop("clarification_kind", None)
+            spec["explicit_fields"] = list(set(spec.get("explicit_fields", [])) | {"metric"})
+            return "resolved", _result_fields(spec)
+    elif kind == "year":
         match = re.fullmatch(r"\s*(?:(?:use|in|year(?:\s+is)?|it\s+is)\s+)?(\d{4})\s*[.!]?\s*", q, re.I)
         if match:
             month = spec.get("period_label", "")
@@ -336,7 +428,7 @@ def resolve_pending_reply(pending: dict | None, reply: str) -> tuple[str, dict |
 
 def build_query_spec(question: str, entities: dict | None = None, *, today: date | None = None, contextual: bool = False) -> dict[str, Any]:
     q = question.replace("’", "'"); lower = q.lower(); period = _resolve_period(q, today if today is not None else reporting_date()); period_explicit = period.pop("period_explicit"); explicit = ["period"] if period_explicit else []
-    payment = bool(PAYMENT_WORDS.search(q))
+    payment = bool(PAYMENT_WORDS.search(q) or DONOR_HISTORY.search(q))
     if payment: explicit.append("subject")
     metric = None
     if re.search(r"\b(?:average|avg)\b", lower): metric = "average"
@@ -355,6 +447,8 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
             metric = None
             explicit = [field for field in explicit if field != "metric"]
     group_by = "ministry" if re.search(r"\b(?:by|per) ministr(?:y|ies)\b", lower) else None
+    if re.search(r"\bmonthly\b|\bmonth[-\s]+by[-\s]+month\b|\b(?:by|per|each|every)\s+(?:calendar\s+)?month\b", lower):
+        group_by = "month"
     if group_by: explicit.append("group_by")
     details = bool(re.search(r"\b(?:details?|list|show|breakdown)\b", lower)) and not metric and not group_by
     if details: explicit.append("detail")
@@ -385,16 +479,20 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
         # The approved default applies to a new report. A genuine follow-up
         # retains the earlier status because this field was not explicit.
         status = "paid"
-    spec = {"subject": "payment" if payment else "other", **period, "status": status, "group_by": group_by, "entity_role": role, "entity_id": None, "entity_name": name, "entity_code": code, "metric": metric, "filters": {}, "explicit_fields": explicit}
+    from components.report_options import report_filters, requested_columns
+    filters = report_filters(q)
+    if filters: explicit.append("filters")
+    spec = {"subject": "payment" if payment else "other", **period, "status": status, "group_by": group_by, "entity_role": role, "entity_id": None, "entity_name": name, "entity_code": code, "metric": metric, "filters": filters, "explicit_fields": explicit}
     if donor_constraint: spec["donor_constraint"] = donor_constraint
-    if _MISSING_CODE_RE.search(q):
+    qualification, _ = qualification_evidence(q)
+    if qualification == "missing_ministry_code":
         spec.update(subject="other", status=None, group_by=None,
                     result_entity="ministry", qualification="missing_ministry_code")
         explicit.extend(("subject", "status", "group_by", "result_entity", "qualification"))
-    elif _MULTI_MINISTRY_DONORS_RE.search(q):
+    elif qualification == "multi_ministry_donor":
         spec.update(subject="payment", result_entity="donor", qualification="multi_ministry_donor")
         explicit.extend(("subject", "result_entity", "qualification"))
-    elif _REPEAT_DONORS_RE.search(q):
+    elif qualification == "repeat_donor":
         spec.update(subject="payment", result_entity="donor", qualification="repeat_donor")
         explicit.extend(("subject", "result_entity", "qualification"))
     elif contextual and re.search(r"\b(?:all|any)\s+(?:donors?|givers?)\b", lower):
@@ -405,14 +503,14 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
     if spec.get("qualification") in {"repeat_donor", "multi_ministry_donor"} and status_explicit and status != "paid":
         spec["clarification"] = "Repeat and multi-ministry donor reports count paid donations. Please ask for a paid-donation report or a separate unpaid-payment report."
         spec["clarification_kind"] = "definition"
-    if spec.get("qualification") and metric in {"total", "average"}:
+    elif spec.get("qualification") and metric in {"total", "average"}:
         spec["clarification"] = "Would you like a list or a count for this report?"
-        spec["clarification_kind"] = "definition"
+        spec["clarification_kind"] = "output"
     if spec.get("qualification") == "missing_ministry_code" and period_explicit:
         spec["clarification"] = "The missing-code report is a current ministry list, not a date-based donation report. Please ask without a period."
         spec["clarification_kind"] = "definition"
     if spec.get("qualification") == "multi_ministry_donor" and role == "receiving_ministry":
-        spec["clarification"] = "Should I find donors who supported this ministry and another ministry, or donors who supported any two ministries?"
+        spec["clarification"] = "This report lists donors who supported any two or more ministries. Please ask without naming one ministry to use that report. A report requiring a particular ministry plus another ministry is not supported yet."
         spec["clarification_kind"] = "definition"
     spec["unsupported_reason"] = unsupported_request_reason(q)
     if spec.get("unsupported_reason"):
@@ -424,11 +522,11 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
     if len(codes) > 1:
         spec["clarification"] = "Please choose one ministry code for this report."
         spec["clarification_kind"] = "ministry"
-    donor_rows = bool((re.search(r"\bdonors?\b", lower) and re.search(r"\b(?:list|show|get|give|which|who)\b", lower)) or _GIVER_LIST_RE.search(lower))
+    donor_rows = bool(((re.search(r"\bdonors?\b", lower) and re.search(r"\b(?:list|show|get|give|which|who)\b", lower)) or _GIVER_LIST_RE.search(lower)) and not DONOR_HISTORY.search(q))
     donor_count = metric == "count" and bool(re.search(r"\b(?:how many|count(?:\s+of)?|number of)\s+(?:the\s+|all\s+)?(?:donors?|givers?)\b", lower))
     if not spec.get("qualification"):
         if payment:
-            spec["result_entity"] = "ministry" if ministry_output else ("donor" if (donor_count or donor_rows and not metric) and not group_by else "payment")
+            spec["result_entity"] = "ministry" if ministry_output else ("donor" if (donor_count or donor_rows and not metric) and (not group_by or donor_count and group_by == "month") else "payment")
         elif re.search(r"\b(?:donors?|contacts?|profile|email|phone)\b", lower) or _GIVER_LIST_RE.search(lower):
             spec["result_entity"] = "donor"
         elif re.search(r"\bministr(?:y|ies)\b", lower):
@@ -447,7 +545,63 @@ def build_query_spec(question: str, entities: dict | None = None, *, today: date
                               spec.get("result_entity") == "donor" else
                               ("details" if spec.get("subject") == "payment" else "list"))
         spec["result_shape"] = "detail"
-    return _result_fields(spec)
+    columns = requested_columns(q, spec.get("result_entity"))
+    if columns:
+        spec["display_columns"] = columns
+        explicit.append("display_columns")
+    ranking = (re.search(r"\b(?:ministries|campaigns)\b.*\b(?:most|least|highest|lowest|top|bottom)\b", lower)
+               or re.search(r"\b(?:top|bottom|highest|lowest)\b.*\bministries\b", lower))
+    if ranking and not spec.get("unsupported_reason") and not spec.get("qualification"):
+        spec.update(subject="payment", status=status if status_explicit else "paid", group_by="ministry", result_entity="payment")
+        spec["ranking"] = {"direction": "asc" if re.search(r"\b(?:least|lowest|bottom)\b", lower) else "desc"}
+        requested_size = re.search(r"\b(?:top|bottom|first)\s+(\d+)\b", lower)
+        if requested_size:
+            if int(requested_size[1]) < 1:
+                spec["clarification"] = "Please choose a positive number of ministries to show."
+                spec["clarification_kind"] = "definition"
+            else:
+                spec["ranking"]["limit"] = min(int(requested_size[1]), 100)
+        explicit.extend(("subject", "group_by", "result_entity", "ranking"))
+        # 'Most support' is not a defined amount/count metric.
+        if metric is None:
+            spec["clarification"] = "Should I rank ministries by total donation amount or by number of donations?"
+            spec["clarification_kind"] = "ranking_metric"
+        spec["metric"] = metric
+    return _result_fields(apply_report_policy(spec))
+
+
+def apply_report_policy(spec: dict, *, default_paid: bool = False) -> dict:
+    """Shared business restrictions for rule-based and model-interpreted plans."""
+    kind, metric = spec.get("qualification"), spec.get("metric")
+    # Apply after ranking/qualification have established the final subject.
+    # The caller disables this for explicit status choices and inherited
+    # payment reports, including a deliberate paid-and-unpaid report.
+    if default_paid and (spec.get("subject") in {"payment", "inactivity"}
+                         or kind in {"repeat_donor", "multi_ministry_donor"}):
+        spec["status"] = "paid"
+    if kind in {"repeat_donor", "multi_ministry_donor"}:
+        spec.update(subject="payment", result_entity="donor")
+        if spec.get("status") != "paid":
+            spec.update(clarification="Repeat and multi-ministry donor reports count paid donations. Please ask for a paid-donation report or a separate unpaid-payment report.", clarification_kind="definition")
+    if kind == "missing_ministry_code":
+        spec.update(subject="other", result_entity="ministry", status=None, group_by=None)
+        if "period" in spec.get("explicit_fields", []):
+            spec.update(clarification="The missing-code report is a current ministry list, not a date-based donation report. Please ask without a period.", clarification_kind="definition")
+    if kind and metric in {"total", "average"} and not spec.get("clarification"):
+        spec.update(clarification="Would you like a list or a count for this report?", clarification_kind="output")
+    if kind == "multi_ministry_donor" and entity_constraints(spec).get("receiving_ministry"):
+        spec.update(clarification="This report lists donors who supported any two or more ministries. Please ask without naming one ministry to use that report. A report requiring a particular ministry plus another ministry is not supported yet.", clarification_kind="definition")
+    if spec.get("group_by") == "month" and not spec.get("clarification"):
+        columns = set(spec.get("display_columns") or [])
+        if spec.get("subject") != "payment" or kind or spec.get("ranking"):
+            spec.update(clarification="I can show monthly donation totals, counts or averages in date order. Please ask for one of those reports without ranking or a special donor qualification.", clarification_kind="definition")
+        elif columns - {"month", "payment_amount"} or (metric == "count" and "payment_amount" in columns):
+            spec.update(clarification="A monthly table shows the month and its donation total, count or average. Please ask for a separate detail list if you need individual donor or payment fields.", clarification_kind="definition")
+        elif metric in {"total", "average", None} and spec.get("result_entity") != "payment":
+            spec.update(clarification="Should I show the donation amount for each month, or count the donors or ministries for each month?", clarification_kind="definition")
+    elif "month" in (spec.get("display_columns") or []) and not spec.get("clarification"):
+        spec.update(clarification="Please ask for a month-by-month donation table to show calendar months, or ask for payment dates in a detail list.", clarification_kind="definition")
+    return spec
 
 def _result_fields(spec: dict) -> dict:
     if spec.get("group_by"): spec["metric"] = spec.get("metric") or "total"; spec["operation"], spec["result_shape"] = "grouped", "grouped"
@@ -457,13 +611,20 @@ def _result_fields(spec: dict) -> dict:
     elif spec.get("subject") == "payment" and spec.get("result_entity") == "payment": spec["operation"], spec["result_shape"] = "details", "detail"
     elif spec.get("operation") == "donor_list": spec["result_shape"] = "detail"
     else: spec["operation"] = "details" if spec.get("subject") == "payment" else "list"; spec["result_shape"] = "detail"
+    # A date-only fragment has no subject until previous report context is
+    # merged. Apply this limitation only to a resolved contact/ministry
+    # profile, including after merge_follow_up calls this shared finalizer.
+    if (spec.get("subject") == "other" and spec.get("result_entity") in {"donor", "ministry"}
+            and spec.get("start_date") and not spec.get("clarification")):
+        spec["clarification"] = "For date-based giving activity, please ask for a donation report or donor donation history. Current donor and ministry profiles do not establish activity in that period."
+        spec["clarification_kind"] = "definition"
     return spec
 
 def merge_follow_up(current: dict, previous: dict | None) -> dict:
     """Called only for genuine follow-ups. Replace complete field bundles."""
     if not previous: return current
     merged = deepcopy(previous); explicit = set(current.get("explicit_fields", []))
-    for field in ("subject", "status", "metric", "group_by", "filters", "result_entity", "qualification", "display_detail"):
+    for field in ("subject", "status", "metric", "group_by", "filters", "result_entity", "qualification", "display_detail", "display_columns", "ranking"):
         if field in explicit: merged[field] = deepcopy(current.get(field))
     # Recalculate operation/result_shape from merged result_entity.
     # Preserve old entity and period filters unless explicitly changed.

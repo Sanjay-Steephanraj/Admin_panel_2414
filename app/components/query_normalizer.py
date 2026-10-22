@@ -133,7 +133,19 @@ def _regex_extract(question: str) -> dict:
             code_high = False   # bare code is ambiguous
 
     # ── Name extraction ──
-    name_match = _NAME_RE.search(normed)
+    # A donor phrase must not become a receiving ministry. For dual requests,
+    # inspect the receiver clause instead of matching across "from X to Y".
+    from components.query_spec import DONOR_LOOKUP, _donor_name
+    donor_name = _donor_name(question)
+    receiver = re.search(r"\b(?:to|for|towards?)\s+(.+)", normed, re.I)
+    if DONOR_LOOKUP.search(question):
+        # 'donor history/profile FOR Jordan' names the donor. A separate
+        # explicit TO clause may still name a receiving ministry.
+        receiver = re.search(r"\b(?:to|towards?)\s+(.+)", normed, re.I)
+    name_text = receiver[1] if receiver else ("" if donor_name else normed)
+    if re.search(r"\bmissing\s+ministry\s+codes?\b", normed, re.I):
+        name_text = ""  # a qualification, not a receiver called 'Missing'
+    name_match = _NAME_RE.search(name_text)
     if name_match:
         candidate = name_match.group(1).strip()
 
@@ -153,7 +165,7 @@ def _regex_extract(question: str) -> dict:
 
     # Preserve official names written as "Ministry of <name>". This must run
     # after suffix extraction so the complete receiver name reaches resolution.
-    of_match = _MINISTRY_OF_RE.search(question)
+    of_match = _MINISTRY_OF_RE.search(name_text)
     if of_match:
         candidate = re.split(
             r"\s+(?:receive[ds]?|donate[ds]?|contribute[ds]?|paid|in|for|from|to|during|over|this|last|all)\b",
@@ -162,6 +174,20 @@ def _regex_extract(question: str) -> dict:
         if candidate:
             name = "Ministry of " + candidate
             name_high = len(candidate.split()) <= 3
+
+    # Explicit receiver clauses need not contain the literal word "Ministry".
+    # Resolve the candidate against the official directory downstream.
+    if not name and not code:
+        clause = receiver
+        if clause:
+            from components.query_spec import _ENTITY_STOP, _MONTH_RE
+            candidate = _ENTITY_STOP.split(clause[1], maxsplit=1)[0].strip(" ,.?!")
+            temporal_candidate = re.sub(r"^(?:the|a|an)\s+", "", candidate, flags=re.I)
+            if (candidate and candidate.lower() not in _STOPWORD_NAMES and not re.match(
+                    rf"(?:\d|{_MONTH_RE}\b|month\b|year\b|week\b|period\b|date\b|range\b|this\b|last\b|previous\b|all\b|each\b|any\b|both\b|paid\b|unpaid\b|pending\b|outstanding\b|completed\b|confirmed\b|us\b|today\b|yesterday\b)", temporal_candidate, re.I)
+                    and not re.match(r"(?:the\s+)?not\s+(?:yet\s+)?paid\b", clause[1], re.I)
+                    and not re.fullmatch(r"the|a|an|ministr(?:y|ies)|donors?|payments?|donations?", candidate, re.I)):
+                name, name_high = candidate, True
 
     # ── Confidence decision ──
     if code and not name:
@@ -176,7 +202,7 @@ def _regex_extract(question: str) -> dict:
         # A bare code alongside a name phrase could be a false positive for either.
         confidence = "high" if code_high else "low"
     else:
-        if _ORG_LIKE_RE_LOCAL.search(normed):
+        if _ORG_LIKE_RE_LOCAL.search(name_text or normed) and (not donor_name or receiver):
             confidence = "low" # Looks like an org, let LLM check
         else:
             confidence = "high"   # nothing found — nothing to be wrong about
@@ -222,7 +248,8 @@ def _llm_extract(question: str) -> dict:
             "- ministry_name: preserve the complete official name, including 'ministry' or 'church', or null\n"
             "- ministry_code: the alphanumeric code only, uppercase, or null\n"
             "- If nothing is mentioned, return null for both fields\n"
-            "- CRITICAL RULE: If the user is asking for 'contact details', 'profile', 'email', 'phone', or explicitly calls the entity a 'donor', the name belongs to a donor/contact, NOT a ministry. In this case, return null for ministry_name.\n"
+            "- A name after by/from identifies the donor; a separate name after to/for identifies the receiving ministry. Keep the receiver even when the question also names a donor.\n"
+            "- For a donor-only contact/profile/email/phone request, return null for ministry_name; never reuse the donor name as the receiver.\n"
             "- Otherwise, if it is an organization like 'Riverstone church', extract 'riverstone' as the ministry_name."
         )
 

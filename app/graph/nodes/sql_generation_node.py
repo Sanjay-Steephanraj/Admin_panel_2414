@@ -6,7 +6,8 @@ from ..states.nlsql_state import NLSQLState
 from llm.gloo_client import get_llm
 from llm.prompts import build_sql_generation_prompt
 from security.domain_guard import domain_guard
-from components.sql_contract import enforce_entity_filter
+from components.sql_contract import (enforce_entity_filter, enforce_monthly_shape,
+    enforce_unrestricted_status, enforce_result_bound, enforce_known_ministry_rows)
 
 logger = logging.getLogger(__name__)
 
@@ -319,12 +320,19 @@ def sql_generation_node(state: NLSQLState) -> NLSQLState:
 
         if fixed_sql is not None:
             final_sql = raw_sql
-        elif query_spec.get("subject") == "payment":
+        elif query_spec.get("subject") == "payment" or query_spec.get("entity_role"):
             # The resolved structured specification is authoritative for all
             # payment SQL. Do not inject raw ministry names/codes alongside it.
             final_sql = enforce_entity_filter(raw_sql, query_spec)
         else:
-            final_sql = _inject_ministry_filter(raw_sql, entities)
+            # Structured directory/contact requests must not use the legacy
+            # name/code scrubber, which can remove legitimate donor filters.
+            final_sql = raw_sql
+
+        final_sql = enforce_unrestricted_status(final_sql, query_spec)
+        final_sql = enforce_monthly_shape(final_sql, query_spec)
+        final_sql = enforce_known_ministry_rows(final_sql, query_spec)
+        final_sql = enforce_result_bound(final_sql, query_spec)
 
         # ── Domain guard validation ──
         is_safe, reason = domain_guard.check_sql(final_sql)

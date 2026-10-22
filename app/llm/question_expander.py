@@ -13,11 +13,15 @@ _FOLLOW_UP_RE = re.compile(
 
 def is_genuine_follow_up(question: str) -> bool:
     q = (question or "").strip()
-    if re.search(r"\b(?:their|those|them|it|that)\b", q, re.I) and re.match(
+    # "that" can introduce a clause in a complete new request. Only a
+    # reference such as "that ministry" carries the previous report forward.
+    contextual_pronoun = bool(re.search(r"\b(?:their|those|them|it)\b", q, re.I) or
+        re.search(r"\bthat\s+(?:ministry|donor|report|list|payment|donation|contribution)\b", q, re.I))
+    if contextual_pronoun and re.match(
         r"^(?:show|list|count|total|average|how many|how much|are)\b", q, re.I
     ):
         return True
-    if re.search(r"\b(?:donations?|payments?|contributions?|donors?|givers?|ministr(?:y|ies))\b", q, re.I) and not re.match(r"^\s*what about\b", q, re.I):
+    if re.search(r"\b(?:donations?|payments?|contributions?|donors?|givers?|ministr(?:y|ies))\b", q, re.I) and not re.match(r"^\s*(?:what|how) about\b", q, re.I):
         if re.search(r"\b(?:show|list|get|count|how many|how much|total|average)\b", q, re.I):
             return False
     if re.search(r"\b(?:donations?|payments?|contributions?)\s+(?:by|per)\s+ministr(?:y|ies)\b", q, re.I):
