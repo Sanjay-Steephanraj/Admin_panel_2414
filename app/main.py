@@ -21,6 +21,8 @@ from components.query_spec import (
     resolve_ministry, resolve_pending_reply, unsupported_request_reason,
 )
 from llm.question_expander import is_genuine_follow_up
+from components.request_fidelity import review_request_fidelity, fidelity_reply
+from components.request_interpreter import interpret_request, compile_interpretation, interpreted_pending_reply
 from tools.db_tool import ping_db
 from llm.question_expander import expand_question
 from llm.rejection_handler import generate_dynamic_error_reply
@@ -213,7 +215,17 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
             session_id=session_id,
         )
     reply_mode, pending_spec = resolve_pending_reply(pending, request.question)
+    interpreted = None
+    if pending and reply_mode != "resolved" and not re.fullmatch(r"[\d\s./?!-]+", request.question):
+        raw_safe, _, _ = await _run_sync(domain_guard.check_question, request.question, contextual_intent="payment")
+        if raw_safe:
+            interpreted = await _run_sync(interpret_request, request.question, pending["query_spec"], pending)
+            if interpreted.get("ok"):
+                reply_mode, pending_spec = interpreted_pending_reply(interpreted["plan"], request.question, pending)
     pending_answer = reply_mode == "resolved"
+    # Keep the already-resolved values; do not resolve relative dates again
+    # after intervening model/database calls (possibly across midnight).
+    confirmed_answer_spec = dict(pending_spec) if pending_answer else None
     if pending and reply_mode in {"resolved", "invalid"}:
         raw_safe, raw_reason, _ = await _run_sync(
             domain_guard.check_question, request.question,
@@ -234,43 +246,13 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
     if pending_answer:
         expanded_question = pending["question"]
 
-    follow_up = is_genuine_follow_up(expanded_question)
     previous = next((t.get("query_spec") for t in reversed(history)
                      if t.get("query_spec") and t.get("query_outcome", "success") == "success"), None)
-    if follow_up and not previous and not pending_answer:
-        return AskResponse(response="Which ministry or donor and which report should I use?",
-                           question=request.question, row_count=0, cache_hit=False,
-                           request_id=request_id, session_id=session_id)
-
-    # ── Ambiguity check (run on EXPANDED question) ──
-    ambiguity_data = None if pending_answer else detect_name_ambiguity(expanded_question)
-    if ambiguity_data:
-        return AskResponse(
-            response=ambiguity_data["clarification_question"],
-            question=request.question,
-            row_count=0,
-            cache_hit=False,
-            request_id=request_id,
-            session_id=session_id,
-        )
-
-    if is_ambiguous(expanded_question) and not follow_up and not pending_answer and not unsupported_request_reason(expanded_question):
-        return AskResponse(
-            response=await _run_sync(generate_dynamic_error_reply, request.question, "ambiguous"),
-            question=request.question,
-            row_count=0,
-            cache_hit=False,
-            request_id=request_id,
-            session_id=session_id,
-        )
-
-    # ── Security check ──
+    # Keep input-injection checks before the model. Domain meaning is decided
+    # by the closed interpreter rather than an earlier keyword rejection.
     is_safe, reason, intent = await _run_sync(
         domain_guard.check_question, expanded_question,
-        contextual_intent=("payment"
-                           if (pending_answer and pending_spec.get("subject") == "payment")
-                           or (follow_up and previous and previous.get("subject") == "payment")
-                           else None),
+        contextual_intent="payment",
     )
     if not is_safe:
         error_type = "injection" if "injection" in reason.lower() else "off_topic"
@@ -283,20 +265,47 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
             session_id=session_id,
         )
 
-    # ── Normalisation + entity extraction ──
-    norm_output = await _run_sync(normalize_question, expanded_question)
-    normalized_question = norm_output["normalized_question"]
-    entities            = norm_output["entities"]
-    query_spec = pending_spec if pending_answer else build_query_spec(expanded_question, entities, contextual=follow_up)
-    if follow_up and not pending_answer:
-        query_spec = merge_follow_up(query_spec, previous)
+    normalized_question = expanded_question  # Preserve the actual user words.
+    follow_up = False
+    if pending_answer:
+        query_spec = pending_spec
+    else:
+        known_limit = unsupported_request_reason(expanded_question)
+        if known_limit:
+            await _save_pending(session_id, None)
+            return AskResponse(response=USER_FACING_LIMITS[known_limit], question=request.question,
+                               row_count=0, cache_hit=False, request_id=request_id, session_id=session_id)
+        interpreted = interpreted or await _run_sync(interpret_request, expanded_question, previous, pending)
+        if not interpreted.get("ok"):
+            return AskResponse(response=interpreted.get("message") or "I couldn’t interpret that request reliably. Please try again.",
+                               question=request.question, row_count=0, cache_hit=False,
+                               request_id=request_id, session_id=session_id)
+        try:
+            compiled = compile_interpretation(interpreted["plan"], expanded_question, previous)
+        except (ValueError, TypeError, KeyError):
+            compiled = {"message": "I couldn’t reliably interpret that report. Please restate the question."}
+        if compiled.get("message"):
+            await _save_pending(session_id, None)
+            return AskResponse(response=compiled["message"], question=request.question,
+                               row_count=0, cache_hit=False, request_id=request_id, session_id=session_id)
+        query_spec, follow_up, intent = compiled["spec"], compiled["follow_up"], compiled["intent"]
+    entities = {"ministry_id": query_spec.get("entity_id"),
+                "ministry_name": query_spec.get("entity_name") if query_spec.get("entity_role") == "receiving_ministry" else None,
+                "ministry_code": query_spec.get("entity_code") if query_spec.get("entity_role") == "receiving_ministry" else None}
+    from components.churn_detector import detect_churn_intent, churn_request_issue
+    if detect_churn_intent(expanded_question):
+        issue = churn_request_issue(query_spec)
+        if issue:
+            await _save_pending(session_id, None)
+            return AskResponse(response=issue, question=request.question, row_count=0,
+                               cache_hit=False, request_id=request_id, session_id=session_id)
     clarification_text = query_spec.get("period_ambiguity") or query_spec.get("clarification")
     if clarification_text:
         if query_spec.get("period_ambiguity"):
             kind = "year" if query_spec.get("period_name") == "month" and not query_spec.get("start_date") else "period"
         else:
             kind = query_spec.get("clarification_kind")
-        if kind in {"year", "period", "status", "ministry"}:
+        if kind in {"year", "period", "status", "ministry", "output", "ranking_metric"}:
             await _save_pending(session_id, {"kind": kind, "question": expanded_question,
                                            "query_spec": query_spec,
                                            "clarification_text": clarification_text, "intent": intent})
@@ -333,15 +342,47 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
         raw_question=request.question,
         expanded_question=expanded_question,
         normalized_question=normalized_question,
-        history=history,
+        history=[] if pending_answer else history,
     )
+    if query_spec.get("subject") == "inactivity" and query_spec.get("metric") not in {None, "count"}:
+        return AskResponse(response="That report identifies donor inactivity from usual giving patterns. You can ask for its count or the next donors. For payment totals or a different period, please ask a new donation-report question.",
+                           question=request.question, row_count=0, cache_hit=False,
+                           request_id=request_id, session_id=session_id)
+    if churn_route is not None and query_spec.get("subject") == "inactivity" and query_spec.get("metric") == "count":
+        churn_route["operation"] = "count"
+    if churn_route is None and query_spec.get("subject") == "inactivity":
+        churn_route = {"offset": 0, "limit": None, "entities_override": None,
+                       "operation": "count" if query_spec.get("metric") == "count" else "list"}
     if churn_route is not None:
         from analysis.churn_analyzer import run_churn_analysis
+        from components.query_spec import reporting_date
         churn_offset = churn_route["offset"]
         churn_limit = churn_route["limit"]
-        churn_entities = churn_route["entities_override"] or entities
+        issue = churn_request_issue(query_spec)
+        if issue:
+            return AskResponse(response=issue, question=request.question, row_count=0,
+                               cache_hit=False, request_id=request_id, session_id=session_id)
+        churn_entities = churn_route["entities_override"] or ({
+            "ministry_id": query_spec.get("entity_id"),
+            "ministry_name": query_spec.get("entity_name"),
+            "ministry_code": query_spec.get("entity_code"),
+        } if query_spec.get("entity_role") == "receiving_ministry" else {})
+        churn_spec = {**query_spec, "subject": "inactivity", "result_entity": "donor", "status": "paid",
+                      "metric": "count" if churn_route.get("operation") == "count" else None,
+                      "result_shape": "scalar" if churn_route.get("operation") == "count" else "detail",
+                      "operation": "inactivity", "period_name": "inactivity_window",
+                      "period_label": "usual giving pattern", "analysis_rule": "cadence_inactivity_48_month_history_24_month_recency"}
+        fidelity = await _run_sync(review_request_fidelity, expanded_question, churn_spec,
+                                  previous if follow_up else None)
+        if fidelity["decision"] != "pass":
+            return AskResponse(response=fidelity_reply(fidelity), question=request.question,
+                               row_count=0, cache_hit=False, request_id=request_id, session_id=session_id)
         logger.info(f"[{request_id}] Churn route → offset={churn_offset} limit={churn_limit}")
-        churn_result = await _run_sync(run_churn_analysis, churn_entities, churn_offset, churn_limit)
+        churn_result = await _run_sync(run_churn_analysis, churn_entities, churn_offset, churn_limit,
+                                       as_of=reporting_date())
+        churn_summary = churn_result["summary"]
+        if churn_route.get("operation") == "count" and not churn_result.get("error"):
+            churn_summary = f"Count: **{churn_result['total_at_risk']:,}** donors flagged by the usual-pattern inactivity report."
 
         # Record the turn so follow-ups (pagination, pronouns) have context.
         # Best-effort: a memory error must not break the churn answer.
@@ -350,25 +391,66 @@ async def ask(request: AskRequest, http_request: Request, http_response: Respons
             turn = {
                 "question": normalized_question,
                 "sql": churn_turn_sql,
-                "summary": churn_result["summary"],
+                "summary": churn_summary,
                 "ts": datetime.utcnow().isoformat(),
                 "churn_offset": churn_result.get("offset", 0),
                 "churn_shown": churn_result.get("shown", 0),
                 "churn_entities": churn_entities,
+                "query_spec": churn_spec,
+                "query_outcome": "success",
             }
+            if churn_route.get("operation") == "count" and history:
+                # A count does not advance the previously displayed list page.
+                turn["churn_offset"] = history[-1].get("churn_offset", 0)
+                turn["churn_shown"] = history[-1].get("churn_shown", 0)
             from graph.pipeline import nlsql_graph
             from memory.conversation_memory import append_turn
-            await _run_sync(
-                append_turn, nlsql_graph, session_id,
-                normalized_question, churn_turn_sql, churn_result["summary"], extra=turn,
-            )
+            if not churn_result.get("error") and churn_result.get("total_at_risk", 0) > 0:
+                await _run_sync(
+                    append_turn, nlsql_graph, session_id,
+                    normalized_question, churn_turn_sql, churn_summary, extra=turn,
+                )
         except Exception:
             logger.warning(f"[{request_id}] Churn turn recording failed", exc_info=True)
 
         return AskResponse(
-            response=churn_result["summary"],
+            response=churn_summary,
             question=request.question,
             row_count=churn_result["row_count"],
+            cache_hit=False,
+            request_id=request_id,
+            session_id=session_id,
+        )
+
+    if follow_up and previous and previous.get("subject") == "inactivity":
+        return AskResponse(response="That report identifies donor inactivity from usual giving patterns. You can ask for its count or the next donors. For payment totals or a different period, please ask a new donation-report question.",
+                           question=request.question, row_count=0, cache_hit=False,
+                           request_id=request_id, session_id=session_id)
+
+    # Check the final, merged report against the user's actual words.
+    # This check can veto SQL, but never rewrites the report.
+    clarification_context = None
+    if pending_answer:
+        # expanded_question is the saved original request at this point.
+        # The verifier must also see the answer that corrected that request.
+        clarification_context = {
+            "kind": pending["kind"],
+            "question": pending.get("clarification_text") or
+                        pending["query_spec"].get("period_ambiguity") or
+                        pending["query_spec"].get("clarification") or "",
+            "answer": request.question,
+            "query_spec": pending["query_spec"],
+            "resolved_query_spec": confirmed_answer_spec,
+        }
+    fidelity = await _run_sync(review_request_fidelity, expanded_question, query_spec,
+                               previous if follow_up and not pending_answer else None,
+                               clarification_context)
+    if fidelity["decision"] != "pass":
+        await _save_pending(session_id, None)
+        return AskResponse(
+            response=fidelity_reply(fidelity),
+            question=request.question,
+            row_count=0,
             cache_hit=False,
             request_id=request_id,
             session_id=session_id,
